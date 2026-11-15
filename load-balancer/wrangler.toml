@@ -1,7 +1,0 @@
-name = "intimora-load-balancer"
-main = "src/index.js"
-compatibility_date = "2026-10-31"
-
-[[triggers]]
-events = ["cron"]
-schedule = "*/2 * * * *"

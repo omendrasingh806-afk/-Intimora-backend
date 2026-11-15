@@ -1,6 +1,0 @@
-# installed with `composer install` (then run: php apply-vendor-patch.php)
-/vendor/
-# live Telegram login, created on the server at first run
-/sessions/telegram.madeline/
-*.log
-/config.local.php
