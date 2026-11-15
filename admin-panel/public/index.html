@@ -1,0 +1,449 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Intimora Local Admin</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      background: linear-gradient(135deg, #0a0a0a 0%, #1a1a2e 100%);
+      color: #e0e0e0;
+      padding: 20px;
+      min-height: 100vh;
+    }
+    .container { max-width: 600px; margin: 0 auto; }
+    h1 {
+      font-size: 1.8rem;
+      margin-bottom: 25px;
+      background: linear-gradient(90deg, #4fc3f7, #81d4fa);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+    .card {
+      background: rgba(26, 26, 26, 0.9);
+      border: 1px solid #333;
+      border-radius: 16px;
+      padding: 24px;
+      margin-bottom: 20px;
+      backdrop-filter: blur(10px);
+    }
+    .card-title {
+      font-size: 1.2rem;
+      margin-bottom: 20px;
+      color: #81d4fa;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    label {
+      display: block;
+      font-size: 0.85rem;
+      color: #aaa;
+      margin-bottom: 6px;
+      font-weight: 500;
+    }
+    input, textarea, select {
+      width: 100%;
+      padding: 12px 14px;
+      background: #2a2a2a;
+      border: 1px solid #3a3a3a;
+      border-radius: 10px;
+      color: #e0e0e0;
+      font-size: 0.9rem;
+      margin-bottom: 16px;
+      transition: border-color 0.2s;
+    }
+    input:focus, textarea:focus, select:focus {
+      outline: none;
+      border-color: #4fc3f7;
+    }
+    input[type="file"] {
+      padding: 10px;
+      border: 2px dashed #444;
+      cursor: pointer;
+    }
+    input[type="file"]::file-selector-button {
+      padding: 8px 16px;
+      background: #333;
+      border: none;
+      border-radius: 8px;
+      color: #e0e0e0;
+      cursor: pointer;
+      margin-right: 12px;
+    }
+    button {
+      padding: 12px 24px;
+      border: none;
+      border-radius: 10px;
+      font-size: 0.95rem;
+      cursor: pointer;
+      font-weight: 600;
+      transition: all 0.2s;
+    }
+    .btn-primary {
+      background: linear-gradient(135deg, #4fc3f7, #29b6f6);
+      color: #0f0f0f;
+    }
+    .btn-primary:hover { transform: translateY(-2px); box-shadow: 0 4px 15px rgba(79,195,247,0.3); }
+    .btn-secondary { background: #333; color: #e0e0e0; }
+    .btn-secondary:hover { background: #444; }
+    .btn-danger { background: #ef5350; color: white; }
+    .btn-danger:hover { background: #e53935; }
+    .btn-sm { padding: 8px 14px; font-size: 0.8rem; }
+    .btn-group { display: flex; gap: 10px; flex-wrap: wrap; }
+    .status {
+      padding: 12px 16px;
+      border-radius: 10px;
+      font-size: 0.85rem;
+      margin-bottom: 16px;
+    }
+    .status-success { background: #1b5e20; color: #a5d6a7; }
+    .status-error { background: #b71c1c; color: #ef9a9a; }
+    .status-info { background: #01579b; color: #90caf9; }
+    .status-loading { background: #4a3f00; color: #ffe082; }
+
+    /* Progress */
+    .progress-container {
+      background: #1e1e1e;
+      border: 1px solid #333;
+      border-radius: 12px;
+      padding: 20px;
+      margin-top: 16px;
+      display: none;
+    }
+    .progress-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 12px;
+    }
+    .progress-label { font-size: 0.9rem; color: #aaa; font-weight: 500; }
+    .progress-percent {
+      font-size: 1.4rem;
+      font-weight: 700;
+      color: #4fc3f7;
+    }
+    .progress-bar-bg {
+      height: 16px;
+      background: #2a2a2a;
+      border-radius: 8px;
+      overflow: hidden;
+      margin-bottom: 14px;
+    }
+    .progress-bar-fill {
+      height: 100%;
+      background: linear-gradient(90deg, #4fc3f7, #29b6f6);
+      border-radius: 8px;
+      transition: width 0.3s ease;
+      width: 0%;
+    }
+    .progress-stats {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 12px;
+      margin-top: 14px;
+    }
+    .stat-box {
+      background: #2a2a2a;
+      border-radius: 8px;
+      padding: 12px;
+      text-align: center;
+    }
+    .stat-label { font-size: 0.7rem; color: #666; margin-bottom: 4px; }
+    .stat-value { font-size: 0.95rem; color: #e0e0e0; font-weight: 600; }
+    .stat-value.speed { color: #4fc3f7; }
+    .stat-value.eta { color: #ffb74d; }
+    .stat-value.size { color: #81c784; }
+
+    /* Video List */
+    .video-list { margin-top: 10px; }
+    .video-item {
+      background: #252525;
+      border: 1px solid #333;
+      border-radius: 10px;
+      padding: 14px;
+      margin-bottom: 10px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      transition: border-color 0.2s;
+    }
+    .video-item:hover { border-color: #4fc3f7; }
+    .video-item-info { flex: 1; }
+    .video-item-title { font-size: 0.95rem; font-weight: 600; }
+    .video-item-meta { font-size: 0.75rem; color: #888; margin-top: 3px; }
+    .badge {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 6px;
+      font-size: 0.7rem;
+      font-weight: 600;
+      margin-left: 6px;
+    }
+    .badge-exclusive { background: #4a148c; color: #ce93d8; }
+    .badge-public { background: #1b5e20; color: #a5d6a7; }
+    .badge-fs { background: #1565c0; color: #90caf9; }
+    .divider { height: 1px; background: #333; margin: 20px 0; }
+    .empty { text-align: center; color: #666; padding: 30px; }
+
+    /* Jobs panel */
+    .job { background:#252525; border:1px solid #333; border-radius:10px; padding:12px; margin-bottom:10px; }
+    .job.running { border-color:#4fc3f7; }
+    .job.done { border-color:#2e7d32; }
+    .job.error { border-color:#c62828; }
+    .job-top { display:flex; justify-content:space-between; gap:8px; align-items:center; }
+    .job-title { font-size:0.9rem; font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .job-stage { font-size:0.8rem; color:#aaa; margin:6px 0; }
+    .job-bar { height:8px; background:#1a1a1a; border-radius:4px; overflow:hidden; }
+    .job-bar > div { height:100%; background:linear-gradient(90deg,#4fc3f7,#81c784); width:0; transition:width .3s; }
+    .job.error .job-bar > div { background:#ef5350; }
+    .job-meta { display:flex; justify-content:space-between; font-size:0.72rem; color:#888; margin-top:6px; flex-wrap:wrap; gap:6px; }
+    .job-err { color:#ef9a9a; font-size:0.8rem; margin-top:6px; word-break:break-word; }
+    .job details { margin-top:6px; }
+    .job summary { font-size:0.72rem; color:#666; cursor:pointer; }
+    .job pre { font-size:0.7rem; color:#999; white-space:pre-wrap; max-height:140px; overflow:auto; margin:6px 0 0; }
+    .steps { display:flex; flex-wrap:wrap; gap:5px; margin:8px 0 2px; }
+    .step { font-size:0.68rem; padding:3px 8px; border-radius:10px; background:#1a1a1a; color:#777; border:1px solid #333; }
+    .step.running { color:#ffe082; border-color:#ffb74d; animation:pulse 1s infinite; }
+    .step.done { color:#a5d6a7; border-color:#2e7d32; } .step.skipped { color:#90caf9; border-color:#1565c0; }
+    .step.error { color:#ef9a9a; border-color:#c62828; }
+    @keyframes pulse { 50% { opacity:.55; } }
+    .badge-run { background:#01579b; color:#90caf9; } .badge-q { background:#4a3f00; color:#ffe082; }
+    .badge-ok { background:#1b5e20; color:#a5d6a7; } .badge-bad { background:#b71c1c; color:#ef9a9a; }
+    .badge-unk { background:#424242; color:#bbb; } .badge-warn { background:#e65100; color:#ffcc80; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>🎬 Intimora Local Admin</h1>
+    <div id="ffmpegStatus" class="status" style="display:none;"></div>
+    <div id="status" class="status status-info" style="display:none;"></div>
+
+    <!-- Upload -->
+    <div class="card">
+      <div class="card-title">⬆️ Upload Video</div>
+      <label>Title</label>
+      <input type="text" id="title" placeholder="Video title">
+      <label>Description</label>
+      <textarea id="description" rows="2" placeholder="Video description"></textarea>
+      <label>Duration (seconds)</label>
+      <input type="number" id="duration" placeholder="e.g. 120">
+      <label>Exclusive Content</label>
+      <select id="exclusive">
+        <option value="false">Non-Exclusive (Public)</option>
+        <option value="true">Exclusive (Premium) 🔒</option>
+      </select>
+      <label>Video File</label>
+      <input type="file" id="videoFile" accept="video/*">
+      <label>Thumbnail (compulsory)</label>
+      <input type="file" id="thumbFile" accept="image/*">
+
+      <div class="progress-container" id="progressContainer">
+        <div class="progress-header">
+          <span class="progress-label" id="progressStep">Upload Progress</span>
+          <span class="progress-percent" id="progressPercent">0%</span>
+        </div>
+        <div class="progress-bar-bg">
+          <div class="progress-bar-fill" id="progressBar"></div>
+        </div>
+        <div class="progress-stats">
+          <div class="stat-box">
+            <div class="stat-label">Uploaded</div>
+            <div class="stat-value size" id="statSize">0 B</div>
+          </div>
+          <div class="stat-box">
+            <div class="stat-label">Speed</div>
+            <div class="stat-value speed" id="statSpeed">—</div>
+          </div>
+          <div class="stat-box">
+            <div class="stat-label">ETA</div>
+            <div class="stat-value eta" id="statEta">—</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="btn-group" style="margin-top:20px;">
+        <button class="btn-primary" onclick="uploadVideo()">Upload to Telegram</button>
+      </div>
+    </div>
+
+    <!-- Jobs -->
+    <div class="card">
+      <div class="card-title">⚙️ Jobs (live)</div>
+      <div id="jobList"><div class="empty">No jobs yet</div></div>
+    </div>
+
+    <!-- Video List -->
+    <div class="card">
+      <div class="card-title">📋 Uploaded Videos</div>
+      <div class="btn-group" style="margin-bottom:16px;">
+        <button class="btn-secondary btn-sm" onclick="loadVideos()">Refresh</button>
+        <button class="btn-secondary btn-sm" onclick="syncVideos()">📡 Sync from Telegram</button>
+        <button class="btn-secondary btn-sm" onclick="exportMetadata()">Export JSON</button>
+      </div>
+      <div class="video-list" id="videoList"></div>
+    </div>
+  </div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+function showStatus(msg, type = 'info') {
+  const el = $('status'); el.textContent = msg; el.className = `status status-${type}`; el.style.display = 'block';
+  clearTimeout(showStatus.t); showStatus.t = setTimeout(() => el.style.display = 'none', 8000);
+}
+function formatBytes(b) {
+  if (!b) return '0 B'; const k = 1024, s = ['B','KB','MB','GB','TB'];
+  const i = Math.min(s.length - 1, Math.floor(Math.log(b) / Math.log(k)));
+  return parseFloat((b / Math.pow(k, i)).toFixed(2)) + ' ' + s[i];
+}
+const fmtT = (s) => { s = Math.round(s); return s < 60 ? s + 's' : Math.floor(s/60) + 'm ' + (s%60) + 's'; };
+
+// ---------- Videos ----------
+let activeVideoIds = '';
+async function loadVideos() {
+  try {
+    const [vr, jr] = await Promise.all([fetch('/api/videos').then(r => r.json()), fetch('/api/jobs').then(r => r.json())]);
+    const busy = new Set(jr.data.jobs.filter(j => j.videoId && (j.status === 'queued' || j.status === 'running')).map(j => j.videoId));
+    const videos = vr.data.videos || [];
+    const list = $('videoList');
+    if (!videos.length) { list.innerHTML = '<div class="empty">No videos uploaded yet</div>'; return; }
+    list.innerHTML = videos.map(v => {
+      const title = v.title || v.video?.tg_filename || 'Untitled';
+      const size = v.video?.tg_size ? formatBytes(v.video.tg_size) : 'Unknown';
+      const dur = v.duration ? fmtT(v.duration) : '—';
+      const date = v.createdAt > 0 ? new Date(v.createdAt * 1000).toLocaleDateString() : 'Unknown';
+      const badge = v.exclusive ? '<span class="badge badge-exclusive">🔒 Exclusive</span>' : '<span class="badge badge-public">Public</span>';
+      const fs = v.is_fast_start === true ? '<span class="badge badge-fs">⚡ Fast-start</span>'
+               : v.is_fast_start === false ? '<span class="badge badge-warn">⚠️ moov at end</span>'
+               : '<span class="badge badge-unk">❓ Not checked</span>';
+      const isBusy = busy.has(v.id);
+      const btn = isBusy ? '<button class="btn-secondary btn-sm" disabled>⏳ Processing…</button>'
+                         : `<button class="btn-secondary btn-sm" onclick="reprocessVideo('${esc(v.id)}')">🔄 Re-process</button>`;
+      return `<div class="video-item"><div class="video-item-info">
+          <div class="video-item-title">${esc(title)} ${badge} ${fs}</div>
+          <div class="video-item-meta">${size} · ${dur} · ${date}</div></div>
+          ${btn}<button class="btn-danger btn-sm" onclick="deleteVideo('${esc(v.id)}')">Delete</button></div>`;
+    }).join('');
+  } catch (e) { showStatus('Error loading videos: ' + e.message, 'error'); }
+}
+
+// ---------- Jobs (polled every second) ----------
+let prevStatus = {};
+const openLogs = new Set();
+function renderJobs(jobs) {
+  const box = $('jobList');
+  if (!jobs.length) { box.innerHTML = '<div class="empty">No jobs yet</div>'; return; }
+  box.innerHTML = jobs.map(j => {
+    const b = j.status === 'running' ? ['badge-run', 'Running'] : j.status === 'queued' ? ['badge-q', 'Queued']
+            : j.status === 'done' ? ['badge-ok', 'Done'] : ['badge-bad', 'Failed'];
+    const kind = j.kind === 'upload' ? '⬆️ Upload' : '🔄 Re-process';
+    const pct = Math.round(j.percent);
+    const meta = [j.detail, j.speed, j.eta ? 'ETA ' + j.eta : ''].filter(Boolean).join(' · ');
+    const skipped = j.status === 'done' && j.result?.skipped ? ' (already fast-start, nothing changed)' : '';
+    return `<div class="job ${j.status}">
+      <div class="job-top"><div class="job-title">${kind}: ${esc(j.title)}</div><span class="badge ${b[0]}">${b[1]}</span></div>
+      <div class="job-stage">${esc(j.stage)}${skipped} — <b>${pct}%</b></div>
+      <div class="steps">${(j.steps || []).map(s => `<span class="step ${s.state}">${{pending:'○',running:'⏳',done:'✅',skipped:'⏭ skipped',error:'❌'}[s.state]} ${esc(s.label)}</span>`).join('')}</div>
+      <div class="job-bar"><div style="width:${pct}%"></div></div>
+      <div class="job-meta"><span>${esc(meta) || '&nbsp;'}</span><span>⏱ ${fmtT(j.elapsed)}</span></div>
+      ${j.error ? `<div class="job-err">❌ ${esc(j.error)}</div>` : ''}
+      <details data-id="${j.id}" ${openLogs.has(j.id) ? 'open' : ''}><summary>Log</summary><pre>${esc(j.log.join('\n'))}</pre></details>
+    </div>`;
+  }).join('');
+  box.querySelectorAll('details').forEach(d => d.addEventListener('toggle', () => d.open ? openLogs.add(d.dataset.id) : openLogs.delete(d.dataset.id)));
+}
+async function pollJobs() {
+  try {
+    const jobs = (await fetch('/api/jobs').then(r => r.json())).data.jobs;
+    renderJobs(jobs);
+    const active = jobs.filter(j => j.videoId && (j.status === 'queued' || j.status === 'running')).map(j => j.videoId).sort().join(',');
+    let changed = active !== activeVideoIds;
+    for (const j of jobs) {
+      if (prevStatus[j.id] && prevStatus[j.id] !== j.status) {
+        changed = true;
+        if (j.status === 'done') showStatus(`✅ ${j.kind === 'upload' ? 'Upload' : 'Re-process'} finished: ${j.title}`, 'success');
+        if (j.status === 'error') showStatus(`❌ Failed: ${j.title} — ${j.error}`, 'error');
+      }
+      prevStatus[j.id] = j.status;
+    }
+    activeVideoIds = active;
+    if (changed) loadVideos();
+  } catch {}
+}
+setInterval(pollJobs, 1000);
+
+// ---------- Upload ----------
+function uploadVideo() {
+  const title = $('title').value, videoFile = $('videoFile').files[0], thumbFile = $('thumbFile').files[0];
+  if (!title) return showStatus('Enter title', 'error');
+  if (!videoFile) return showStatus('Select video file', 'error');
+  if (!thumbFile) return showStatus('Thumbnail is compulsory', 'error');
+  const fd = new FormData();
+  fd.append('title', title); fd.append('description', $('description').value); fd.append('duration', $('duration').value);
+  fd.append('exclusive', $('exclusive').value); fd.append('video', videoFile); fd.append('thumb', thumbFile);
+
+  $('progressContainer').style.display = 'block';
+  $('progressStep').textContent = 'Copying to local server…';
+  const xhr = new XMLHttpRequest(); const t0 = Date.now();
+  xhr.open('POST', '/api/upload');
+  xhr.upload.onprogress = (e) => {
+    if (!e.lengthComputable) return;
+    const p = Math.round(e.loaded / e.total * 100), el = (Date.now() - t0) / 1000, sp = el > 0 ? e.loaded / el : 0;
+    $('progressBar').style.width = p + '%'; $('progressPercent').textContent = p + '%';
+    $('statSize').textContent = formatBytes(e.loaded) + ' / ' + formatBytes(e.total);
+    $('statSpeed').textContent = formatBytes(sp) + '/s'; $('statEta').textContent = sp ? fmtT((e.total - e.loaded) / sp) : '—';
+  };
+  xhr.onload = () => {
+    $('progressContainer').style.display = 'none';
+    try {
+      const d = JSON.parse(xhr.responseText);
+      if (!d.ok) return showStatus('Error: ' + d.error, 'error');
+      showStatus('Upload started — watch live progress in "Jobs" below ⬇️', 'info');
+      ['title', 'description', 'duration', 'videoFile', 'thumbFile'].forEach(i => $(i).value = '');
+      $('exclusive').value = 'false';
+      pollJobs();
+    } catch (e) { showStatus('Error: ' + e.message, 'error'); }
+  };
+  xhr.onerror = () => { $('progressContainer').style.display = 'none'; showStatus('Network error — is the server running?', 'error'); };
+  xhr.send(fd);
+}
+
+// ---------- Other actions ----------
+async function reprocessVideo(id) {
+  const d = await fetch('/api/reprocess/' + encodeURIComponent(id), { method: 'POST' }).then(r => r.json());
+  if (!d.ok) return showStatus('Error: ' + d.error, 'error');
+  showStatus('Re-process started — watch "Jobs" below ⬇️', 'info'); pollJobs();
+}
+async function syncVideos() {
+  showStatus('Syncing videos from Telegram…', 'loading');
+  try {
+    const d = await fetch('/api/sync-videos', { method: 'POST' }).then(r => r.json());
+    if (!d.ok) return showStatus('Error: ' + d.error, 'error');
+    showStatus(`Sync complete! ${d.data.added} new videos added (scanned ${d.data.scanned} messages). ${d.data.total} total.`, 'success'); loadVideos();
+  } catch (e) { showStatus('Error: ' + e.message, 'error'); }
+}
+async function deleteVideo(id) {
+  if (!confirm('Remove from this list? (Telegram message is NOT deleted)')) return;
+  await fetch('/api/delete/' + encodeURIComponent(id), { method: 'POST' }); loadVideos();
+}
+function exportMetadata() {
+  fetch('/api/export').then(r => r.blob()).then(blob => {
+    const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'intimora-metadata.json'; a.click(); URL.revokeObjectURL(a.href);
+  });
+}
+async function checkHealth() {
+  try {
+    const h = (await fetch('/api/health').then(r => r.json())).data, el = $('ffmpegStatus');
+    el.textContent = (h.ffmpeg ? '✅ FFmpeg ready' : '⚠️ FFmpeg NOT found (run npm install)') + ' · ' + (h.telegram ? '✅ Telegram connected' : '⏳ Telegram connecting…');
+    el.className = 'status ' + (h.ffmpeg && h.telegram ? 'status-success' : 'status-error'); el.style.display = 'block';
+    if (!(h.ffmpeg && h.telegram)) setTimeout(checkHealth, 3000);
+  } catch {}
+}
+loadVideos(); checkHealth(); pollJobs();
+</script>
+</body>
+</html>
