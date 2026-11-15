@@ -33,6 +33,12 @@ define('FIREBASE_AUTH_DOMAIN', 'intimora-app.firebaseapp.com');
 // === Admin ===
 define('ADMIN_API_KEY', 'Prashant');
 
+// === BestFile (video hosting — sign-in via email) ===
+define('BESTFILE_EMAIL', 'pr3095079@gmail.com');
+define('BESTFILE_PASSWORD', 'noida123');
+define('BESTFILE_HOST', 'bestfile.io');
+define('BESTFILE_SESSION_FILE', sys_get_temp_dir() . '/intimora_bestfile_session.json');
+
 // === Site ===
 define('SITE_URL', 'https://intimora-api2.site.je');
 

@@ -8,6 +8,7 @@ const serverless = require("serverless-http");
 const store = require("./store");
 const tg = require("./telegram");
 const users = require("./users");
+const bestfile = require("./bestfile");
 
 // ---- Firebase Auth — token verification via REST API (no service account key needed) ----
 const FIREBASE_API_KEY = process.env.FIREBASE_API_KEY;
@@ -189,6 +190,16 @@ app.get("/api/videos/:id/stream", async (req, res) => {
   try {
     const v = await store.getVideo(req.params.id);
     if (!v) return fail(res, "Video not found", 404);
+
+    // --- BestFile first: if the video has a BestFile link, redirect to its CDN ---
+    if (v.bestfile && v.bestfile.download_link) {
+      const cdnUrl = await bestfile.bfGetCdnUrl(v.bestfile.download_link);
+      if (cdnUrl) {
+        res.status(302).set("Location", cdnUrl).set("Cache-Control", "public, max-age=300");
+        return;
+      }
+      // If CDN URL fetch fails, fall through to Telegram MTProto streaming below
+    }
 
     const streamFormat = store.toStreamFormat(v);
     const fileSize = streamFormat.tg_size;

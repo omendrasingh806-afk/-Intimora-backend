@@ -4,5 +4,7 @@
   "session": "YOUR_STRING_SESSION",
   "videoChannel": "-1003756299546",
   "thumbChannel": "-1004360811639",
-  "metaChannel": "-1003777974779"
+  "metaChannel": "-1003777974779",
+  "bestfileEmail": "YOUR_BESTFILE_EMAIL",
+  "bestfilePassword": "YOUR_BESTFILE_PASSWORD"
 }

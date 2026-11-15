@@ -30,6 +30,7 @@
 require_once __DIR__ . '/config.php';
 require_once __DIR__ . '/store.php';
 require_once __DIR__ . '/telegram.php';
+require_once __DIR__ . '/bestfile.php';
 
 // === CORS ===
 header('Access-Control-Allow-Origin: *');
@@ -288,6 +289,19 @@ if (preg_match('#^/api/videos/([^/]+)/stream$#', $path, $m) && ($method === 'GET
     $video = store_get_video(urldecode($m[1]));
     if (!$video) {
         json_fail('Video not found', 404);
+    }
+
+    // --- BestFile first: if the video has a BestFile link, redirect to its CDN ---
+    $bfLink = $video['bestfile']['download_link'] ?? '';
+    if ($bfLink) {
+        $cdnUrl = bestfile_get_cdn_url($bfLink);
+        if ($cdnUrl) {
+            http_response_code(302);
+            header('Location: ' . $cdnUrl);
+            header('Cache-Control: public, max-age=300');
+            exit;
+        }
+        // If CDN URL fetch fails, fall through to Telegram MTProto streaming below
     }
 
     $stream = store_to_stream_format($video);

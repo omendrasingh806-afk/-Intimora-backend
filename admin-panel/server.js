@@ -8,6 +8,7 @@ const multer = require('multer');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const https = require('https');
 const { execSync, spawn } = require('child_process');
 
 // ================= Config =================
@@ -132,19 +133,31 @@ function remuxFastStart(input, output, onBytes) {
 
 // ================= Job system (live tracking) =================
 const STEPS = {
-  upload: [['check', 'Check moov'], ['convert', 'Move moov to start'], ['connect', 'Connect'], ['video', 'Upload video'], ['thumb', 'Thumbnail'], ['meta', 'Metadata']],
   reprocess: [['download', 'Download'], ['check', 'Check moov'], ['convert', 'Move moov to start'], ['connect', 'Connect'], ['video', 'Upload video'], ['meta', 'Metadata'], ['cleanup', 'Delete old']],
 };
+// Upload steps are built per-job from the selected targets.
+// Metadata always goes to Telegram, so 'connect' + 'meta' are always present.
+function buildUploadSteps(targets) {
+  const steps = [['check', 'Check moov'], ['convert', 'Move moov to start'], ['connect', 'Connect to Telegram']];
+  for (const t of targets) {
+    if (t === 'telegram') steps.push(['video', 'Upload to Telegram'], ['thumb', 'Thumbnail']);
+    if (t === 'bestfile') steps.push(['bestfile', 'Upload to BestFile']);
+  }
+  steps.push(['meta', 'Metadata']);
+  return steps;
+}
 const jobs = new Map();
 let queue = Promise.resolve();
 
-function createJob(kind, title, videoId = null) {
+function createJob(kind, title, videoId = null, targets = []) {
   const job = {
     id: crypto.randomBytes(4).toString('hex'), kind, title, videoId,
+    targets: (targets || []).slice(),
     status: 'queued', stage: 'Waiting in queue…', percent: 0,
     detail: '', speed: '', eta: '', log: [], error: null, result: null,
     createdAt: Date.now(), startedAt: null, finishedAt: null, temp: [],
-    steps: STEPS[kind].map(([key, label]) => ({ key, label, state: 'pending' })),
+    steps: (kind === 'upload' ? buildUploadSteps(targets) : STEPS[kind])
+      .map(([key, label]) => ({ key, label, state: 'pending' })),
   };
   jobs.set(job.id, job);
   if (jobs.size > 40) {
@@ -269,11 +282,131 @@ async function sendVideo(job, peer, filePath, caption, thumbPath, from, to) {
   return { msg, size };
 }
 
+// ================= BestFile (email sign-in + chunked-style upload) =================
+// Verified flow: login (POST /en/login) -> refresh CSRF (GET /en) -> upload (POST /upload).
+const BF_HOST = 'bestfile.io';
+const BF_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36';
+let bfCookies = {};      // name -> value (in-memory session, local tool only)
+let bfCsrf = '';
+let bfLoggedIn = false;
+
+function bfCookieHeader() {
+  return Object.entries(bfCookies).map(([k, v]) => k + '=' + v).join('; ');
+}
+function bfStoreCookies(setCookie) {
+  if (!setCookie) return;
+  for (const c of (Array.isArray(setCookie) ? setCookie : [setCookie])) {
+    const m = c.match(/^([^=]+)=([^;]*)/);
+    if (m) bfCookies[m[1].trim()] = m[2];
+  }
+}
+// Low-level request. body: string (urlencoded) or null.
+function bfRequest(method, reqPath, { headers = {}, body = null } = {}) {
+  return new Promise((resolve, reject) => {
+    const req = https.request({
+      hostname: BF_HOST, path: reqPath, method,
+      headers: { 'User-Agent': BF_UA, Cookie: bfCookieHeader(), ...headers },
+    }, (res) => {
+      bfStoreCookies(res.headers['set-cookie']);
+      const chunks = [];
+      res.on('data', (d) => chunks.push(d));
+      res.on('end', () => resolve({
+        status: res.statusCode, headers: res.headers,
+        body: Buffer.concat(chunks).toString('utf-8'),
+      }));
+    });
+    req.on('error', reject);
+    if (body) { req.setHeader('Content-Length', Buffer.byteLength(body)); req.end(body); }
+    else req.end();
+  });
+}
+const bfCsrfFrom = (html) => { const m = html.match(/csrf-token" content="([^"]+)"/); return m ? m[1] : ''; };
+
+async function bfRefreshCsrf() {
+  const r = await bfRequest('GET', '/en');
+  bfCsrf = bfCsrfFrom(r.body);
+  return bfCsrf;
+}
+async function bfLogin() {
+  const r1 = await bfRequest('GET', '/en/login');
+  const csrf = bfCsrfFrom(r1.body);
+  const form = new URLSearchParams({
+    _token: csrf, email: config.bestfileEmail, password: config.bestfilePassword,
+  }).toString();
+  const r2 = await bfRequest('POST', '/en/login', {
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Referer': `https://${BF_HOST}/en/login` },
+    body: form,
+  });
+  if (r2.status !== 302) throw new Error(`BestFile login failed (HTTP ${r2.status}). Check bestfileEmail/bestfilePassword in config.json.`);
+  bfLoggedIn = true;
+  await bfRefreshCsrf();
+}
+async function bfEnsureLogin() {
+  if (!bfLoggedIn) await bfLogin();
+  else await bfRefreshCsrf();
+}
+
+// Upload one file to BestFile with live progress. Returns { download_id, download_link }.
+async function bfUpload(job, filePath, from, to) {
+  const size = fs.statSync(filePath).size;
+  const tick = stage(job, '⬆️ Uploading to BestFile…', from, to, size);
+  const boundary = '----bf' + Date.now().toString(16) + Math.random().toString(16).slice(2);
+  const fileName = path.basename(filePath);
+  const fileStream = fs.createReadStream(filePath);
+  let uploaded = 0;
+  fileStream.on('data', (d) => { uploaded += d.length; tick(uploaded, size); });
+
+  const attempt = (csrf) => new Promise((resolve, reject) => {
+    const req = https.request({
+      hostname: BF_HOST, path: '/upload', method: 'POST',
+      headers: {
+        'User-Agent': BF_UA, Cookie: bfCookieHeader(),
+        'X-CSRF-TOKEN': csrf, 'Referer': `https://${BF_HOST}/en`,
+        'Content-Type': 'multipart/form-data; boundary=' + boundary,
+      },
+    }, (res) => {
+      bfStoreCookies(res.headers['set-cookie']);
+      const chunks = [];
+      res.on('data', (d) => chunks.push(d));
+      res.on('end', () => {
+        const body = Buffer.concat(chunks).toString('utf-8');
+        try {
+          const j = JSON.parse(body);
+          if (j.type === 'success') { tick(size, size); resolve(j); }
+          else reject(new Error('BestFile upload error: ' + (j.msg || j.error || body.slice(0, 200))));
+        } catch { reject(new Error('BestFile upload bad response: ' + body.slice(0, 200))); }
+      });
+    });
+    req.on('error', reject);
+    req.write(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${fileName}"\r\nContent-Type: application/octet-stream\r\n\r\n`);
+    fileStream.pipe(req, { end: false });
+    fileStream.on('end', () => {
+      req.write(`\r\n--${boundary}\r\nContent-Disposition: form-data; name="upload_auto_delete"\r\n\r\n0\r\n--${boundary}\r\nContent-Disposition: form-data; name="size"\r\n\r\n${size}\r\n--${boundary}--\r\n`);
+      req.end();
+    });
+    fileStream.on('error', reject);
+  });
+
+  await bfEnsureLogin();
+  try {
+    return await attempt(bfCsrf);
+  } catch (e) {
+    // Session may have expired (CSRF 419 / redirect) -> re-login once and retry.
+    bfLoggedIn = false;
+    await bfLogin();
+    return await attempt(bfCsrf);
+  }
+}
+
 // ================= Job: upload =================
 async function doUpload(job, p) {
   job.temp.push(p.videoPath, p.thumbPath);
   let finalPath = p.videoPath;
+  const targets = job.targets.filter((t) => t === 'telegram' || t === 'bestfile');
+  const hasTg = targets.includes('telegram');
+  const hasBf = targets.includes('bestfile');
 
+  // ---- Common: check moov + convert to fast-start (runs ONCE) ----
   job.stage = 'Checking where moov atom is…'; job.percent = 2; step(job, 'check', 'running');
   const info = analyzeMp4(p.videoPath);
   const ext = path.extname(p.origName).toLowerCase();
@@ -301,46 +434,93 @@ async function doUpload(job, p) {
     jlog(job, 'moov already at start → conversion skipped');
   }
 
-  job.stage = 'Connecting to Telegram…'; job.detail = ''; job.speed = ''; job.eta = ''; step(job, 'connect', 'running');
+  // ---- Allocate percent ranges across selected targets ----
+  let cursor = upFrom;
+  let tgEnd = 100, bfStart = cursor;
+  if (hasTg && hasBf) { tgEnd = Math.round(cursor + (100 - cursor) * 0.5); bfStart = tgEnd; }
+  else if (hasTg) { tgEnd = 100; }
+  else { bfStart = cursor; }
+
+  let tgInfo = null;
+
+  // ---- Always connect to Telegram (metadata always goes to Telegram) ----
+  step(job, 'connect', 'running');
+  job.stage = 'Connecting to Telegram…';
   await ensureConnected();
-  const inputVideo = await tg.getInputEntity(config.videoChannel);
-  const inputThumb = await tg.getInputEntity(config.thumbChannel);
   const inputMeta = await tg.getInputEntity(config.metaChannel);
+  let inputVideo = null, inputThumb = null;
+  if (hasTg) {
+    inputVideo = await tg.getInputEntity(config.videoChannel);
+    inputThumb = await tg.getInputEntity(config.thumbChannel);
+  }
   step(job, 'connect', 'done');
 
-  step(job, 'video', 'running');
-  const { msg: videoMsg, size } = await sendVideo(job, inputVideo, finalPath, p.title, p.thumbPath, upFrom, 92);
-  step(job, 'video', 'done');
+  // ---- Telegram target: video file + thumbnail (only if Telegram selected) ----
+  if (hasTg) {
+    step(job, 'video', 'running');
+    job.stage = '⬆️ Uploading video to Telegram…';
+    const { msg: videoMsg, size } = await sendVideo(job, inputVideo, finalPath, p.title, p.thumbPath, cursor, tgEnd);
+    step(job, 'video', 'done');
 
-  step(job, 'thumb', 'running');
-  job.stage = 'Uploading thumbnail'; job.percent = 93; jlog(job, 'Uploading thumbnail');
-  const thumbMsg = await tg.sendFile(inputThumb, { file: p.thumbPath, forceDocument: false, workers: 2 });
-  step(job, 'thumb', 'done');
+    step(job, 'thumb', 'running');
+    job.stage = '⬆️ Uploading thumbnail to Telegram…'; job.percent = Math.min(99, tgEnd - 1);
+    jlog(job, 'Uploading thumbnail');
+    const thumbMsg = await tg.sendFile(inputThumb, { file: p.thumbPath, forceDocument: false, workers: 2 });
+    step(job, 'thumb', 'done');
 
-  const doc = videoMsg.document || videoMsg.media?.document;
-  const photo = thumbMsg.photo || thumbMsg.media?.photo;
+    const doc = videoMsg.document || videoMsg.media?.document;
+    const photo = thumbMsg.photo || thumbMsg.media?.photo;
+    tgInfo = {
+      video: {
+        tg_doc_id: doc?.id ? String(doc.id) : '', tg_access_hash: doc?.accessHash ? String(doc.accessHash) : '',
+        tg_file_ref: refToBase64(doc?.fileReference), tg_size: doc?.size ? Number(doc.size) : size,
+        tg_mime: doc?.mimeType || 'video/mp4', tg_channel: config.videoChannel, tg_msg_id: videoMsg.id,
+        tg_filename: p.origName.replace(/\.[^.]+$/, '') + '.mp4',
+      },
+      thumbnail: {
+        thumb_doc_id: photo?.id ? String(photo.id) : '', thumb_access_hash: photo?.accessHash ? String(photo.accessHash) : '',
+        thumb_file_ref: refToBase64(photo?.fileReference), thumb_size: p.thumbSize, thumb_msg_id: thumbMsg.id,
+      },
+      meta_msg_id: null,
+    };
+  }
+
+  // ---- BestFile target: video file only ----
+  let bfInfo = null;
+  if (hasBf) {
+    step(job, 'bestfile', 'running');
+    job.stage = '⬆️ Uploading video to BestFile…';
+    bfInfo = await bfUpload(job, finalPath, bfStart, 100);
+    step(job, 'bestfile', 'done');
+    jlog(job, `BestFile upload done → ${bfInfo.download_link}`);
+  }
+
+  // ---- Build metadata (BestFile link lives inside the metadata) ----
   const metadata = {
-    t: 'meta', id: `local-${Date.now()}`, title: p.title, description: p.description || '', exclusive: !!p.exclusive,
-    views: 0, likes: 0, shares: 0, likedBy: [], duration, createdAt: Math.floor(Date.now() / 1000),
-    video: {
-      tg_doc_id: doc?.id ? String(doc.id) : '', tg_access_hash: doc?.accessHash ? String(doc.accessHash) : '',
-      tg_file_ref: refToBase64(doc?.fileReference), tg_size: doc?.size ? Number(doc.size) : size,
-      tg_mime: doc?.mimeType || 'video/mp4', tg_channel: config.videoChannel, tg_msg_id: videoMsg.id,
-      tg_filename: p.origName.replace(/\.[^.]+$/, '') + '.mp4',
-    },
-    thumbnail: {
-      thumb_doc_id: photo?.id ? String(photo.id) : '', thumb_access_hash: photo?.accessHash ? String(photo.accessHash) : '',
-      thumb_file_ref: refToBase64(photo?.fileReference), thumb_size: p.thumbSize, thumb_msg_id: thumbMsg.id,
-    },
+    t: 'meta', id: `local-${Date.now()}`, title: p.title, description: p.description || '',
+    exclusive: !!p.exclusive, targets,
+    views: 0, likes: 0, shares: 0, likedBy: [], duration,
+    createdAt: Math.floor(Date.now() / 1000),
   };
+  if (hasTg) { metadata.video = tgInfo.video; metadata.thumbnail = tgInfo.thumbnail; }
+  if (hasBf) {
+    metadata.bestfile = {
+      download_id: bfInfo.download_id, download_link: bfInfo.download_link,
+      size: fs.statSync(finalPath).size,
+    };
+  }
 
+  // ---- Metadata ALWAYS sent to Telegram (holds the BestFile link too) ----
   step(job, 'meta', 'running');
-  job.stage = 'Saving metadata'; job.percent = 97; jlog(job, 'Sending metadata to Telegram');
+  job.stage = '⬆️ Saving metadata to Telegram…'; job.percent = 97; jlog(job, 'Sending metadata to Telegram');
   const metaMsg = await tg.sendMessage(inputMeta, { message: JSON.stringify(metadata) });
-  localMetadata.unshift({ ...metadata, is_fast_start: true, meta_msg_id: metaMsg.id });
-  saveMetadata();
+  metadata.meta_msg_id = metaMsg.id;
+  if (tgInfo) tgInfo.meta_msg_id = metaMsg.id;
   step(job, 'meta', 'done');
-  job.result = { id: metadata.id };
+
+  localMetadata.unshift({ ...metadata, is_fast_start: true });
+  saveMetadata();
+  job.result = { id: metadata.id, targets, telegram: hasTg, bestfile: hasBf };
 }
 
 // ================= Job: re-process =================
@@ -396,53 +576,80 @@ async function doReprocess(job, videoId) {
     } catch (e) { jlog(job, '⚠️ Thumbnail not re-attached: ' + e.message); }
   }
 
-  // 5. upload new
-  job.stage = 'Connecting to Telegram…'; job.detail = ''; job.speed = ''; job.eta = ''; step(job, 'connect', 'running');
-  await ensureConnected();
-  const inputVideo = await tg.getInputEntity(config.videoChannel);
-  step(job, 'connect', 'done');
-  step(job, 'video', 'running');
-  const { msg: newMsg, size: newSize } = await sendVideo(job, inputVideo, fixed, v.title, thumb, 51, 90);
-  step(job, 'video', 'done');
-  const doc = newMsg.document || newMsg.media?.document;
+  const targets = (v.targets || ['telegram']).filter((t) => t === 'telegram' || t === 'bestfile');
+  const hasTg = targets.includes('telegram');
+  const hasBf = targets.includes('bestfile');
+
+  // 5. upload new (to each selected target)
+  let newMsg = null, newSize = 0, doc = null;
+  if (hasTg) {
+    job.stage = '⬆️ Uploading to Telegram…'; job.detail = ''; job.speed = ''; job.eta = ''; step(job, 'connect', 'running');
+    await ensureConnected();
+    const inputVideo = await tg.getInputEntity(config.videoChannel);
+    step(job, 'connect', 'done');
+    step(job, 'video', 'running');
+    job.stage = '⬆️ Uploading to Telegram…';
+    const r = await sendVideo(job, inputVideo, fixed, v.title, thumb, 51, 85);
+    newMsg = r.msg; newSize = r.size;
+    step(job, 'video', 'done');
+    doc = newMsg.document || newMsg.media?.document;
+  }
+
+  let bfInfo = null;
+  if (hasBf) {
+    job.stage = '⬆️ Uploading to BestFile…';
+    bfInfo = await bfUpload(job, fixed, hasTg ? 85 : 51, 95);
+    jlog(job, `BestFile re-upload done → ${bfInfo.download_link}`);
+  }
 
   // 6. update local + Telegram metadata
   step(job, 'meta', 'running');
   job.stage = 'Updating metadata'; job.percent = 92; jlog(job, 'Updating metadata');
-  const updated = {
-    ...v, is_fast_start: true,
-    video: {
+  const updated = { ...v, is_fast_start: true };
+  if (hasTg) {
+    updated.video = {
       ...v.video, tg_doc_id: doc?.id ? String(doc.id) : '', tg_access_hash: doc?.accessHash ? String(doc.accessHash) : '',
       tg_file_ref: refToBase64(doc?.fileReference), tg_size: doc?.size ? Number(doc.size) : newSize,
       tg_mime: doc?.mimeType || 'video/mp4', tg_channel: config.videoChannel, tg_msg_id: newMsg.id,
-    },
-  };
+    };
+  }
+  if (hasBf) {
+    updated.bestfile = {
+      download_id: bfInfo.download_id, download_link: bfInfo.download_link,
+      size: fs.statSync(fixed).size,
+    };
+  }
   if (!updated.duration) updated.duration = await probeDuration(fixed);
 
   // The metadata channel still points at the OLD message → edit it (or create one if none exists).
-  const inputMeta = await tg.getInputEntity(config.metaChannel);
-  let metaId = v.meta_msg_id || (await findMetaMessage(oldMsgId));
-  const text = JSON.stringify(tgMetaOf(updated));
-  if (metaId) {
-    await tg.editMessage(inputMeta, { message: metaId, text });
-    jlog(job, `Metadata message ${metaId} updated in Telegram`);
-  } else {
-    const m = await tg.sendMessage(inputMeta, { message: text });
-    metaId = m.id;
-    jlog(job, `No old metadata message found → created new one (${metaId})`);
+  if (hasTg) {
+    const inputMeta = await tg.getInputEntity(config.metaChannel);
+    let metaId = v.meta_msg_id || (await findMetaMessage(oldMsgId));
+    const text = JSON.stringify(tgMetaOf(updated));
+    if (metaId) {
+      await tg.editMessage(inputMeta, { message: metaId, text });
+      jlog(job, `Metadata message ${metaId} updated in Telegram`);
+    } else {
+      const m = await tg.sendMessage(inputMeta, { message: text });
+      metaId = m.id;
+      jlog(job, `No old metadata message found → created new one (${metaId})`);
+    }
+    updated.meta_msg_id = metaId;
   }
-  updated.meta_msg_id = metaId;
   localMetadata[localMetadata.findIndex((x) => x.id === videoId)] = updated;
   saveMetadata();
   step(job, 'meta', 'done');
 
   // 7. delete old video message last (everything else already succeeded)
-  step(job, 'cleanup', 'running');
-  job.stage = 'Deleting old video message'; job.percent = 97;
-  try { await tg.deleteMessages(inputVideo, [oldMsgId], { revoke: true }); jlog(job, 'Old message deleted'); }
-  catch (e) { jlog(job, '⚠️ Could not delete old message: ' + e.message); }
-  step(job, 'cleanup', 'done');
-  job.result = { newMsgId: newMsg.id };
+  if (hasTg) {
+    step(job, 'cleanup', 'running');
+    job.stage = 'Deleting old video message'; job.percent = 97;
+    const inputVideo = await tg.getInputEntity(config.videoChannel);
+    try { await tg.deleteMessages(inputVideo, [oldMsgId], { revoke: true }); jlog(job, 'Old message deleted'); }
+    catch (e) { jlog(job, '⚠️ Could not delete old message: ' + e.message); }
+    step(job, 'cleanup', 'done');
+  }
+  job.result = { newMsgId: newMsg?.id, targets, telegram: hasTg, bestfile: hasBf };
 }
 
 // ================= Sync =================
@@ -495,7 +702,7 @@ const upload = multer({
 app.use(express.static(path.join(__dirname, 'public')));
 app.use(express.json());
 
-app.get('/api/health', (req, res) => res.json({ ok: true, data: { status: 'up', ffmpeg: ffmpegAvailable, telegram: tgReady } }));
+app.get('/api/health', (req, res) => res.json({ ok: true, data: { status: 'up', ffmpeg: ffmpegAvailable, telegram: tgReady, bestfile: !!(config.bestfileEmail && config.bestfilePassword) } }));
 app.get('/api/ffmpeg-status', (req, res) => res.json({ ok: true, data: { available: ffmpegAvailable } }));
 app.get('/api/videos', (req, res) => res.json({ ok: true, data: { videos: localMetadata, nextCursor: null } }));
 app.get('/api/jobs', (req, res) => res.json({ ok: true, data: { jobs: [...jobs.values()].reverse().map(publicJob) } }));
@@ -504,19 +711,30 @@ app.get('/api/jobs/:id', (req, res) => {
   j ? res.json({ ok: true, data: publicJob(j) }) : res.status(404).json({ ok: false, error: 'Job not found' });
 });
 
+// Parse selected upload targets from the form. Default: Telegram.
+function parseTargets(raw) {
+  let arr = [];
+  if (Array.isArray(raw)) arr = raw;
+  else if (typeof raw === 'string') arr = raw.split(',').map((s) => s.trim()).filter(Boolean);
+  arr = arr.filter((t) => t === 'telegram' || t === 'bestfile');
+  return arr.length ? arr : ['telegram'];
+}
+
 // Upload: returns immediately with a jobId; everything else runs as a tracked job.
 app.post('/api/upload', upload.fields([{ name: 'video', maxCount: 1 }, { name: 'thumb', maxCount: 1 }]), (req, res) => {
   const v = req.files?.video?.[0], t = req.files?.thumb?.[0];
   const bad = (msg) => { rm(v?.path); rm(t?.path); res.status(400).json({ ok: false, error: msg }); };
   if (!req.body.title) return bad('Title required');
   if (!v) return bad('Video required');
-  if (!t) return bad('Thumbnail required');
-  const job = createJob('upload', req.body.title);
+  const targets = parseTargets(req.body.targets);
+  const needsThumb = targets.includes('telegram');
+  if (needsThumb && !t) return bad('Thumbnail required (needed for Telegram upload)');
+  const job = createJob('upload', req.body.title, null, targets);
   runJob(job, (j) => doUpload(j, {
     title: req.body.title, description: req.body.description, exclusive: req.body.exclusive === 'true',
-    duration: parseInt(req.body.duration) || 0, videoPath: v.path, thumbPath: t.path, thumbSize: t.size, origName: v.originalname,
+    duration: parseInt(req.body.duration) || 0, videoPath: v.path, thumbPath: t?.path, thumbSize: t?.size || 0, origName: v.originalname,
   }));
-  res.json({ ok: true, data: { jobId: job.id } });
+  res.json({ ok: true, data: { jobId: job.id, targets } });
 });
 
 app.post('/api/reprocess/:id', (req, res) => {
@@ -527,9 +745,10 @@ app.post('/api/reprocess/:id', (req, res) => {
       return res.status(409).json({ ok: false, error: 'Already being processed', jobId: j.id });
     }
   }
-  const job = createJob('reprocess', v.title || v.video?.tg_filename || 'Untitled', v.id);
+  const targets = (v.targets || ['telegram']).filter((t) => t === 'telegram' || t === 'bestfile');
+  const job = createJob('reprocess', v.title || v.video?.tg_filename || 'Untitled', v.id, targets);
   runJob(job, (j) => doReprocess(j, v.id));
-  res.json({ ok: true, data: { jobId: job.id } });
+  res.json({ ok: true, data: { jobId: job.id, targets } });
 });
 
 app.post('/api/delete/:id', (req, res) => {

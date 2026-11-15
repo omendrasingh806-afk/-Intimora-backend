@@ -123,6 +123,11 @@ function store_public_video($v) {
         'createdAt' => (int) ($v['createdAt'] ?? 0),
         'streamUrl' => '/api/videos/' . ($v['id'] ?? '') . '/stream',
         'thumbnailUrl' => '/api/videos/' . ($v['id'] ?? '') . '/thumbnail',
+        'bestfile' => [
+            'download_id' => $v['bestfile']['download_id'] ?? '',
+            'download_link' => $v['bestfile']['download_link'] ?? '',
+            'size' => (int) ($v['bestfile']['size'] ?? 0),
+        ],
     ];
 }
 
