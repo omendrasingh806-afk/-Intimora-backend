@@ -328,6 +328,10 @@ async function bfRefreshCsrf() {
   return bfCsrf;
 }
 async function bfLogin() {
+  // Always start from a clean session: /en/login redirects to /user when already
+  // signed in, which yields an empty CSRF token and a 419 on the POST.
+  bfCookies = {};
+  bfCsrf = '';
   const r1 = await bfRequest('GET', '/en/login');
   const csrf = bfCsrfFrom(r1.body);
   const form = new URLSearchParams({
@@ -352,17 +356,22 @@ async function bfUpload(job, filePath, from, to) {
   const tick = stage(job, '⬆️ Uploading to BestFile…', from, to, size);
   const boundary = '----bf' + Date.now().toString(16) + Math.random().toString(16).slice(2);
   const fileName = path.basename(filePath);
-  const fileStream = fs.createReadStream(filePath);
-  let uploaded = 0;
-  fileStream.on('data', (d) => { uploaded += d.length; tick(uploaded, size); });
+  const head = `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${fileName}"\r\nContent-Type: application/octet-stream\r\n\r\n`;
+  const tail = `\r\n--${boundary}\r\nContent-Disposition: form-data; name="upload_auto_delete"\r\n\r\n0\r\n--${boundary}\r\nContent-Disposition: form-data; name="size"\r\n\r\n${size}\r\n--${boundary}--\r\n`;
 
   const attempt = (csrf) => new Promise((resolve, reject) => {
+    // Fresh stream per attempt: a stream opened before the login round-trip is
+    // already drained (the progress listener puts it in flowing mode), so the
+    // request body would never end and the upload would hang.
+    const fileStream = fs.createReadStream(filePath);
+    let uploaded = 0;
     const req = https.request({
       hostname: BF_HOST, path: '/upload', method: 'POST',
       headers: {
         'User-Agent': BF_UA, Cookie: bfCookieHeader(),
         'X-CSRF-TOKEN': csrf, 'Referer': `https://${BF_HOST}/en`,
         'Content-Type': 'multipart/form-data; boundary=' + boundary,
+        'Content-Length': Buffer.byteLength(head) + size + Buffer.byteLength(tail),
       },
     }, (res) => {
       bfStoreCookies(res.headers['set-cookie']);
@@ -378,12 +387,10 @@ async function bfUpload(job, filePath, from, to) {
       });
     });
     req.on('error', reject);
-    req.write(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${fileName}"\r\nContent-Type: application/octet-stream\r\n\r\n`);
+    req.write(head);
+    fileStream.on('data', (d) => { uploaded += d.length; tick(uploaded, size); });
     fileStream.pipe(req, { end: false });
-    fileStream.on('end', () => {
-      req.write(`\r\n--${boundary}\r\nContent-Disposition: form-data; name="upload_auto_delete"\r\n\r\n0\r\n--${boundary}\r\nContent-Disposition: form-data; name="size"\r\n\r\n${size}\r\n--${boundary}--\r\n`);
-      req.end();
-    });
+    fileStream.on('end', () => { req.write(tail); req.end(); });
     fileStream.on('error', reject);
   });
 
@@ -391,7 +398,7 @@ async function bfUpload(job, filePath, from, to) {
   try {
     return await attempt(bfCsrf);
   } catch (e) {
-    // Session may have expired (CSRF 419 / redirect) -> re-login once and retry.
+    // Session may have expired (CSRF 419 / redirect) -> fresh login once and retry.
     bfLoggedIn = false;
     await bfLogin();
     return await attempt(bfCsrf);

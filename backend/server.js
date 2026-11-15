@@ -172,6 +172,7 @@ app.get("/api/videos/:id/thumbnail", async (req, res) => {
   try {
     const v = await store.getVideo(req.params.id);
     if (!v) return fail(res, "Video not found", 404);
+    if (!v.thumbnail) return fail(res, "No thumbnail", 404);
     const streamFormat = store.toStreamFormat(v);
     const img = await tg.fetchThumbnail(streamFormat);
     if (!img) return fail(res, "No thumbnail", 404);
@@ -193,13 +194,21 @@ app.get("/api/videos/:id/stream", async (req, res) => {
 
     // --- BestFile first: if the video has a BestFile link, redirect to its CDN ---
     if (v.bestfile && v.bestfile.download_link) {
-      const cdnUrl = await bestfile.bfGetCdnUrl(v.bestfile.download_link);
+      let cdnUrl = null;
+      try {
+        cdnUrl = await bestfile.bfGetCdnUrl(v.bestfile.download_link);
+      } catch (e) {
+        console.error("bestfile cdn error:", e.message);
+      }
       if (cdnUrl) {
-        res.status(302).set("Location", cdnUrl).set("Cache-Control", "public, max-age=300");
+        res.status(302).set("Location", cdnUrl).set("Cache-Control", "no-store");
         return;
       }
       // If CDN URL fetch fails, fall through to Telegram MTProto streaming below
     }
+
+    // BestFile-only videos have no Telegram copy to fall back to.
+    if (!v.video) return fail(res, "No playable source for this video", 404);
 
     const streamFormat = store.toStreamFormat(v);
     const fileSize = streamFormat.tg_size;
@@ -420,8 +429,13 @@ app.get("/api/user/referrals", auth, async (req, res) => {
 app.post("/api/admin/metadata", adminAuth, async (req, res) => {
   try {
     const metadata = req.body;
-    if (!metadata || !metadata.id || !metadata.video) {
-      return fail(res, "Missing required fields (id, video)");
+    if (!metadata || !metadata.id) {
+      return fail(res, "Missing required fields (id)");
+    }
+    const hasTgVideo = !!(metadata.video && (metadata.video.tg_doc_id || metadata.video.docId));
+    const bfLink = metadata.bestfile && metadata.bestfile.download_link;
+    if (!hasTgVideo && !bfLink) {
+      return fail(res, "Missing video (Telegram) or bestfile.download_link");
     }
 
     // Normalize field names from admin panel format (tg_doc_id → docId etc.)
@@ -436,7 +450,11 @@ app.post("/api/admin/metadata", adminAuth, async (req, res) => {
       likedBy: metadata.likedBy || [],
       duration: metadata.duration || 0,
       createdAt: metadata.createdAt || Math.floor(Date.now() / 1000),
-      video: {
+    };
+    if (metadata.targets) normalized.targets = metadata.targets;
+
+    if (hasTgVideo) {
+      normalized.video = {
         docId: metadata.video.tg_doc_id || metadata.video.docId,
         accessHash: metadata.video.tg_access_hash || metadata.video.accessHash,
         fileRef: metadata.video.tg_file_ref || metadata.video.fileRef,
@@ -444,15 +462,27 @@ app.post("/api/admin/metadata", adminAuth, async (req, res) => {
         mime: metadata.video.tg_mime || metadata.video.mime || "video/mp4",
         msgId: metadata.video.tg_msg_id || metadata.video.msgId,
         filename: metadata.video.tg_filename || metadata.video.filename || "video.mp4",
-      },
-      thumbnail: metadata.thumbnail ? {
+      };
+    }
+
+    if (metadata.thumbnail) {
+      normalized.thumbnail = {
         docId: metadata.thumbnail.thumb_doc_id || metadata.thumbnail.docId,
         accessHash: metadata.thumbnail.thumb_access_hash || metadata.thumbnail.accessHash,
         fileRef: metadata.thumbnail.thumb_file_ref || metadata.thumbnail.fileRef,
         size: metadata.thumbnail.thumb_size || metadata.thumbnail.size,
         msgId: metadata.thumbnail.thumb_msg_id || metadata.thumbnail.msgId,
-      } : null,
-    };
+      };
+    }
+
+    // BestFile video-only uploads: the B2-backed link lives inside the metadata.
+    if (bfLink) {
+      normalized.bestfile = {
+        download_id: metadata.bestfile.download_id || "",
+        download_link: metadata.bestfile.download_link,
+        size: metadata.bestfile.size || 0,
+      };
+    }
 
     const metaMsgId = await tg.sendMetadata(normalized);
     ok(res, { id: metadata.id, meta_msg_id: metaMsgId });

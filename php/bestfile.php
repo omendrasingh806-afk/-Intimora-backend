@@ -115,10 +115,13 @@ function bestfile_login() {
     [$st, $html] = bestfile_request('GET', '/en/login', $session);
     $csrf = bestfile_csrf_from($html);
     // 2. POST login
-    [$st, $body] = bestfile_request('POST', '/en/login', $session, [
+    [$st, $body, $eff] = bestfile_request('POST', '/en/login', $session, [
         'form' => ['_token' => $csrf, 'email' => BESTFILE_EMAIL, 'password' => BESTFILE_PASSWORD],
     ]);
-    if ($st !== 302) {
+    // Redirects are followed, so a successful login ends on /user (the followed
+    // request may answer 405) instead of the raw 302.
+    $loggedIn = ($st === 302) || stripos((string)$eff, '/user') !== false;
+    if (!$loggedIn) {
         return false; // login failed (wrong email/password, or CSRF)
     }
     // 3. Refresh CSRF from an authenticated page
