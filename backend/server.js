@@ -9,6 +9,7 @@ const store = require("./store");
 const tg = require("./telegram");
 const users = require("./users");
 const bestfile = require("./bestfile");
+const phpProxy = require("./phpProxy");
 
 // ---- Firebase Auth — token verification via REST API (no service account key needed) ----
 const FIREBASE_API_KEY = process.env.FIREBASE_API_KEY;
@@ -132,6 +133,35 @@ function adminAuth(req, res, next) {
 // ============================================================
 
 app.get("/api/health", (req, res) => ok(res, { status: "up", time: Date.now() }));
+
+// ---- PHP backend proxy ----
+// The PHP servers sit behind a hosting-level browser challenge that blocks any
+// non-browser client. phpProxy solves that cookie and forwards the request.
+app.use("/api/php", async (req, res) => {
+  try {
+    const rest = req.originalUrl.replace(/^\/api\/php/, "") || "/api/health";
+    const fwdHeaders = {};
+    for (const h of ["authorization", "range", "if-range", "x-api-key", "x-admin-key"]) {
+      if (req.headers[h]) fwdHeaders[h] = req.headers[h];
+    }
+    let body = null;
+    if (req.method !== "GET" && req.method !== "HEAD") {
+      body = Buffer.from(JSON.stringify(req.body || {}));
+      fwdHeaders["content-type"] = "application/json";
+      fwdHeaders["content-length"] = String(body.length);
+    }
+    const r = await phpProxy.phpFetch(rest, { method: req.method, headers: fwdHeaders, body });
+    for (const h of ["content-type", "content-range", "accept-ranges", "location"]) {
+      if (r.headers[h]) res.set(h, r.headers[h]);
+    }
+    if (!r.headers["content-range"] && !r.headers["location"]) {
+      res.set("Content-Length", String(r.body.length));
+    }
+    res.status(r.status).end(r.body);
+  } catch (e) {
+    fail(res, e.message || "PHP backend unavailable", 502);
+  }
+});
 
 // Infinite scroll — cursor-based pagination
 app.get("/api/videos", async (req, res) => {
