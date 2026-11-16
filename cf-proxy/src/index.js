@@ -177,7 +177,10 @@ function aesCbcDecryptNoPadding(cipher, key, iv) {
 
 // ------------------------------------------------------------- challenge glue
 
-let cookieCache = { backend: "", value: "", exp: 0 };
+// The __test token is host independent: one solved token works on every PHP
+// server behind the same hosting (verified on both servers), so it is cached
+// once and reused for all backends.
+let cookieCache = { value: "", exp: 0 };
 
 function solveChallenge(html) {
   const m = String(html).match(
@@ -197,15 +200,38 @@ async function refreshCookie(backend) {
   const html = await res.text();
   const token = solveChallenge(html);
   if (!token) throw new Error("Hosting challenge could not be solved");
-  cookieCache = { backend, value: token, exp: Date.now() + COOKIE_TTL_MS };
+  cookieCache = { value: token, exp: Date.now() + COOKIE_TTL_MS };
   return token;
 }
 
 async function ensureCookie(backend) {
-  if (!cookieCache.value || cookieCache.backend !== backend || cookieCache.exp < Date.now()) {
+  if (!cookieCache.value || cookieCache.exp < Date.now()) {
     await refreshCookie(backend);
   }
   return cookieCache.value;
+}
+
+// ------------------------------------------------------------ backend routing
+
+function backendList(env) {
+  const raw = env.PHP_BACKEND_URLS || env.PHP_BACKEND_URL || DEFAULT_BACKEND;
+  const list = String(raw)
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .map((s) => s.replace(/\/+$/, ""));
+  return list.length ? list : [DEFAULT_BACKEND];
+}
+
+// /b1/api/... -> first backend, /b2/api/... -> second backend, /api/... -> first
+function resolveTarget(url, env) {
+  const list = backendList(env);
+  const m = url.pathname.match(/^\/b(\d+)(\/.*)?$/);
+  if (m) {
+    const index = Math.max(1, parseInt(m[1], 10)) - 1;
+    return { backend: list[index] || list[0], path: (m[2] || "/") + url.search };
+  }
+  return { backend: list[0], path: url.pathname + url.search };
 }
 
 function isChallengeResponse(res) {
@@ -243,8 +269,8 @@ function withCors(response, request, env) {
 // ------------------------------------------------------------------- handler
 
 async function forward(request, env, url) {
-  const backend = String(env.PHP_BACKEND_URL || DEFAULT_BACKEND).replace(/\/+$/, "");
-  const target = backend + url.pathname + url.search;
+  const { backend, path } = resolveTarget(url, env);
+  const target = backend + path;
 
   const headers = new Headers();
   for (const name of FORWARD_REQUEST_HEADERS) {
@@ -287,21 +313,20 @@ export default {
     }
 
     if (url.pathname === "/" || url.pathname === "/__health") {
-      const backend = String(env.PHP_BACKEND_URL || DEFAULT_BACKEND).replace(/\/+$/, "");
+      const list = backendList(env);
       let token = cookieCache.value;
-      let expiresIn = Math.max(0, Math.round((cookieCache.exp - Date.now()) / 1000));
       try {
-        token = await ensureCookie(backend);
-        expiresIn = Math.max(0, Math.round((cookieCache.exp - Date.now()) / 1000));
+        token = await ensureCookie(list[0]);
       } catch (e) {
-        return withCors(
-          Response.json({ ok: false, error: e.message }, { status: 502 }),
-          request,
-          env
-        );
+        return withCors(Response.json({ ok: false, error: e.message }, { status: 502 }), request, env);
       }
       return withCors(
-        Response.json({ ok: true, backend, cookieExpiresInSec: expiresIn, solved: !!token }),
+        Response.json({
+          ok: true,
+          backends: list,
+          cookieExpiresInSec: Math.max(0, Math.round((cookieCache.exp - Date.now()) / 1000)),
+          solved: !!token,
+        }),
         request,
         env
       );
