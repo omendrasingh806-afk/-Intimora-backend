@@ -133,6 +133,15 @@ function adminAuth(req, res, next) {
 
 app.get("/api/health", (req, res) => ok(res, { status: "up", time: Date.now() }));
 
+// TEMP diagnostics route for the BestFile flow (remove after debugging).
+app.get("/api/_bfdebug", async (req, res) => {
+  try {
+    const link = req.query.link || "https://bestfile.io/IuDdb4dJawWNk1E/file";
+    const steps = await bestfile.bfDebug(link);
+    ok(res, { steps });
+  } catch (e) { fail(res, e.message, 500); }
+});
+
 // Infinite scroll — cursor-based pagination
 app.get("/api/videos", async (req, res) => {
   try {
