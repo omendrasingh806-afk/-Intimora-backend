@@ -1,0 +1,8 @@
+name = "intimora-php-proxy"
+main = "src/index.js"
+compatibility_date = "2026-10-31"
+
+# PHP backend that sits behind the hosting security challenge.
+[vars]
+PHP_BACKEND_URL = "https://intimora-api3.site.je"
+ALLOWED_ORIGINS = "https://intimora.new.tg,https://intimora.tg,http://localhost:5173"
