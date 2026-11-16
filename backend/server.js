@@ -133,29 +133,6 @@ function adminAuth(req, res, next) {
 
 app.get("/api/health", (req, res) => ok(res, { status: "up", time: Date.now() }));
 
-// TEMP diagnostics route for the BestFile flow (remove after debugging).
-app.get("/api/_bfdebug", async (req, res) => {
-  try {
-    const out = {};
-    let link = req.query.link || "https://bestfile.io/IuDdb4dJawWNk1E/file";
-    if (req.query.id) {
-      const t0 = Date.now();
-      const v = await store.getVideo(req.query.id);
-      out.getVideoMs = Date.now() - t0;
-      out.found = !!v;
-      out.hasTgVideo = !!(v && v.video);
-      out.bestfileLink = v && v.bestfile ? v.bestfile.download_link : null;
-      if (v && v.bestfile && v.bestfile.download_link) link = v.bestfile.download_link;
-      const t1 = Date.now();
-      const cdn = await bestfile.bfGetCdnUrl(link);
-      out.cdnMs = Date.now() - t1;
-      out.cdnHost = cdn ? new URL(cdn).hostname : null;
-    }
-    out.steps = await bestfile.bfDebug(link);
-    ok(res, out);
-  } catch (e) { fail(res, e.message, 500); }
-});
-
 // Infinite scroll — cursor-based pagination
 app.get("/api/videos", async (req, res) => {
   try {
@@ -224,8 +201,12 @@ app.get("/api/videos/:id/stream", async (req, res) => {
         console.error("bestfile cdn error:", e.message);
       }
       if (cdnUrl) {
-        res.status(302).set("Location", cdnUrl).set("Cache-Control", "no-store");
-        return;
+        // Express does not close a response that only sets status + headers,
+        // so the redirect must be ended explicitly (otherwise the request hangs).
+        res.status(302);
+        res.set("Location", cdnUrl);
+        res.set("Cache-Control", "no-store");
+        return res.end();
       }
       // If CDN URL fetch fails, fall through to Telegram MTProto streaming below
     }
