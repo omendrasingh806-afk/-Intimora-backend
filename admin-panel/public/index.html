@@ -339,10 +339,12 @@ async function loadVideos() {
       const isBusy = busy.has(v.id);
       const btn = isBusy ? '<button class="btn-secondary btn-sm" disabled>⏳ Processing…</button>'
                          : `<button class="btn-secondary btn-sm" onclick="reprocessVideo('${esc(v.id)}')">🔄 Re-process</button>`;
+      const bfBtn = v.bestfile ? ''
+                   : `<button class="btn-secondary btn-sm" onclick="setBestfileLink('${esc(v.id)}')">🔗 BestFile link</button>`;
       return `<div class="video-item"><div class="video-item-info">
           <div class="video-item-title">${esc(title)} ${badge} ${fs} ${bf}</div>
           <div class="video-item-meta">${size} · ${dur} · ${date}${v.bestfile ? ' · ' + esc(v.bestfile.download_link) : ''}</div></div>
-          ${btn}<button class="btn-danger btn-sm" onclick="deleteVideo('${esc(v.id)}')">Delete</button></div>`;
+          ${bfBtn}${btn}<button class="btn-danger btn-sm" onclick="deleteVideo('${esc(v.id)}')">Delete</button></div>`;
     }).join('');
   } catch (e) { showStatus('Error loading videos: ' + e.message, 'error'); }
 }
@@ -465,6 +467,21 @@ async function syncVideos() {
     showStatus(`Sync complete! ${d.data.added} new videos added (scanned ${d.data.scanned} messages). ${d.data.total} total.`, 'success'); loadVideos();
   } catch (e) { showStatus('Error: ' + e.message, 'error'); }
 }
+// BestFile link manually add karo (Cloudflare login block hone par).
+async function setBestfileLink(id) {
+  const link = prompt('BestFile download link paste karo:\n(e.g. https://bestfile.io/abc123)');
+  if (!link) return;
+  try {
+    const j = await fetch('/api/bestfile/' + encodeURIComponent(id) + '/link', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ download_link: link.trim() }),
+    }).then((r) => r.json());
+    if (!j.ok) return showStatus(j.error || 'Failed to save link', 'error');
+    showStatus('BestFile link saved — Telegram: ' + (j.data.telegram || 'n/a'), 'success');
+    loadVideos();
+  } catch (e) { showStatus('Error: ' + e.message, 'error'); }
+}
+
 async function deleteVideo(id) {
   if (!confirm('Remove from this list? (Telegram message is NOT deleted)')) return;
   await fetch('/api/delete/' + encodeURIComponent(id), { method: 'POST' }); loadVideos();
@@ -477,11 +494,28 @@ function exportMetadata() {
 async function checkHealth() {
   try {
     const h = (await fetch('/api/health').then(r => r.json())).data, el = $('ffmpegStatus');
-    const bf = h.bestfile ? '✅ BestFile ready' : '⚠️ BestFile not configured';
-    el.textContent = (h.ffmpeg ? '✅ FFmpeg ready' : '⚠️ FFmpeg NOT found (run npm install)') + ' · ' + (h.telegram ? '✅ Telegram connected' : '⏳ Telegram connecting…') + ' · ' + bf;
-    el.className = 'status ' + (h.ffmpeg && h.telegram && h.bestfile ? 'status-success' : 'status-error'); el.style.display = 'block';
-    if (!(h.ffmpeg && h.telegram && h.bestfile)) setTimeout(checkHealth, 3000);
+    const s = h.bestfileStatus || { state: h.bestfile ? 'connected' : 'error', message: '' };
+    const bf = { connected: '✅ BestFile connected', checking: '⏳ BestFile connecting…', blocked: '❌ BestFile blocked (Cloudflare)',
+                 not_configured: '⚠️ BestFile not configured', error: '❌ BestFile login failed' }[s.state] || '❌ BestFile';
+    const head = (h.ffmpeg ? '✅ FFmpeg ready' : '⚠️ FFmpeg NOT found (run npm install)') + ' · ' + (h.telegram ? '✅ Telegram connected' : '⏳ Telegram connecting…') + ' · ' + bf;
+    el.innerHTML = esc(head) + (s.state === 'connected' || s.state === 'checking' ? '' : '<div style="margin-top:6px;font-size:0.75rem">' + esc(s.message) + '</div>')
+      + (s.state === 'checking' ? '' : ' <button class="btn-secondary btn-sm" style="margin-top:6px" onclick="recheckBestfile()">🔄 Check BestFile</button>')
+      + (s.state === 'connected' ? ' <button class="btn-secondary btn-sm" style="margin-top:6px" onclick="browserLoginBestfile()">🖥️ BestFile window</button>' : '')
+      + (s.state === 'connected' || s.state === 'checking' ? '' : ' <button class="btn-secondary btn-sm" style="margin-top:6px" onclick="browserLoginBestfile()">🌐 Browser mein login (Cloudflare)</button>');
+    const allOk = h.ffmpeg && h.telegram && s.state === 'connected';
+    el.className = 'status ' + (allOk ? 'status-success' : 'status-error'); el.style.display = 'block';
+    if (!h.telegram || s.state === 'checking') setTimeout(checkHealth, 3000);
   } catch {}
+}
+async function browserLoginBestfile() {
+  $('ffmpegStatus').textContent = '⏳ BestFile window panel ke side khul rahi hai — wahan Cloudflare check par click karo…';
+  try { await fetch('/api/bestfile/browser-login', { method: 'POST' }); } catch {}
+  setTimeout(checkHealth, 2000);
+}
+async function recheckBestfile() {
+  $('ffmpegStatus').textContent = '⏳ Checking BestFile login…';
+  try { await fetch('/api/bestfile/check', { method: 'POST' }); } catch {}
+  checkHealth();
 }
 loadVideos(); checkHealth(); pollJobs();
 </script>

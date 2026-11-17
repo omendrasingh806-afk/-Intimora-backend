@@ -285,10 +285,25 @@ async function sendVideo(job, peer, filePath, caption, thumbPath, from, to) {
 // ================= BestFile (email sign-in + chunked-style upload) =================
 // Verified flow: login (POST /en/login) -> refresh CSRF (GET /en) -> upload (POST /upload).
 const BF_HOST = 'bestfile.io';
-const BF_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36';
+// cf_clearance only works with the exact User-Agent of the browser that solved the
+// challenge, so the browser-login flow saves it as config.bestfileUserAgent.
+let BF_UA = config.bestfileUserAgent || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36';
 let bfCookies = {};      // name -> value (in-memory session, local tool only)
 let bfCsrf = '';
 let bfLoggedIn = false;
+let bfBrowserContext = null;
+let bfBrowserPage = null;
+function bfHasBrowser() {
+  return bfBrowserContext && bfBrowserPage && !bfBrowserPage.isClosed();
+}
+async function bfBrowserRequest(method, reqPath, { headers = {}, body = null } = {}) {
+  if (!bfHasBrowser()) throw new Error('BestFile Chrome window band hai. Browser login dobara kholo.');
+  return bfBrowserPage.evaluate(async ({ method, reqPath, headers, body }) => {
+    if (location.origin !== 'https://bestfile.io') throw new Error('BestFile browser tab must stay on bestfile.io');
+    const response = await fetch(reqPath, { method, headers, body, credentials: 'include', signal: AbortSignal.timeout(30000) });
+    return { status: response.status, headers: Object.fromEntries(response.headers), body: await response.text(), url: response.url };
+  }, { method, reqPath, headers, body });
+}
 
 function bfCookieHeader() {
   return Object.entries(bfCookies).map(([k, v]) => k + '=' + v).join('; ');
@@ -302,6 +317,11 @@ function bfStoreCookies(setCookie) {
 }
 // Low-level request. body: string (urlencoded) or null.
 function bfRequest(method, reqPath, { headers = {}, body = null } = {}) {
+  if (bfHasBrowser()) {
+    const browserHeaders = { ...headers };
+    delete browserHeaders.Referer;
+    return bfBrowserRequest(method, reqPath, { headers: browserHeaders, body });
+  }
   return new Promise((resolve, reject) => {
     const req = https.request({
       hostname: BF_HOST, path: reqPath, method,
@@ -324,15 +344,66 @@ const bfCsrfFrom = (html) => { const m = html.match(/csrf-token" content="([^"]+
 
 async function bfRefreshCsrf() {
   const r = await bfRequest('GET', '/en');
+  if (bfIsChallenge(r)) throw new Error(BF_CF_HINT);
   bfCsrf = bfCsrfFrom(r.body);
+  if (r.status !== 200 || !bfCsrf || /href=["'][^"']*\/en\/login/i.test(r.body)) {
+    bfLoggedIn = false;
+    throw new Error('BestFile session expired. Chrome window mein BestFile login complete karo.');
+  }
   return bfCsrf;
 }
+// bestfile.io sits behind Cloudflare, which answers non-browser clients with a
+// "Just a moment..." challenge (HTTP 403) instead of the login form. Detect it
+// so the panel can say what to do instead of blaming the password.
+const bfIsChallenge = (r) =>
+  !!r && r.status === 403 && /Just a moment|__cf_chl|cf-browser-verification|cf_chl_opt/i.test(r.body || '');
+
+const BF_CF_HINT =
+  'BestFile Cloudflare challenge de raha hai (HTTP 403 "Just a moment..."). ' +
+  '"🌐 Browser mein login (Cloudflare)" dabao, khuli Chrome window mein challenge solve karo, aur woh window khuli rakho — login aur upload usi window ke browser session se honge.';
+
+// Cookies pasted into config.json (needed when Cloudflare blocks the plain login).
+function bfSeedCookies() {
+  const raw = String(config.bestfileCookies || '').trim();
+  if (!raw) return false;
+  for (const part of raw.split(';')) {
+    const m = part.match(/^\s*([^=]+)=([\s\S]*)$/);
+    if (m) bfCookies[m[1].trim()] = m[2].trim();
+  }
+  return Object.keys(bfCookies).length > 0;
+}
+
 async function bfLogin() {
-  // Always start from a clean session: /en/login redirects to /user when already
-  // signed in, which yields an empty CSRF token and a 419 on the POST.
+  if (bfHasBrowser()) {
+    await bfRefreshCsrf();
+    bfLoggedIn = true;
+    return;
+  }
+  // With pasted cookies the session may already be signed in.
+  if (String(config.bestfileCookies || '').trim()) {
+    bfCookies = {};
+    bfCsrf = '';
+    bfSeedCookies();
+    const r0 = await bfRequest('GET', '/en');
+    if (bfIsChallenge(r0)) throw new Error(BF_CF_HINT);
+    const csrf0 = bfCsrfFrom(r0.body);
+    if (csrf0 && !/href="[^"]*\/en\/login"/i.test(r0.body)) {
+      bfCsrf = csrf0;
+      bfLoggedIn = true;
+      return;
+    }
+  }
+
+  // Clean app session (/en/login redirects to /user when already signed in, which
+  // yields an empty CSRF token and a 419), but keep the Cloudflare clearance
+  // cookies captured from the browser so the password login passes Cloudflare.
   bfCookies = {};
   bfCsrf = '';
+  if (bfSeedCookies()) {
+    for (const k of Object.keys(bfCookies)) if (!/^(cf_clearance|__cf_bm|_cfuvid)$/.test(k)) delete bfCookies[k];
+  }
   const r1 = await bfRequest('GET', '/en/login');
+  if (bfIsChallenge(r1)) throw new Error(BF_CF_HINT);
   const csrf = bfCsrfFrom(r1.body);
   const form = new URLSearchParams({
     _token: csrf, email: config.bestfileEmail, password: config.bestfilePassword,
@@ -341,6 +412,7 @@ async function bfLogin() {
     headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Referer': `https://${BF_HOST}/en/login` },
     body: form,
   });
+  if (bfIsChallenge(r2)) throw new Error(BF_CF_HINT);
   if (r2.status !== 302) throw new Error(`BestFile login failed (HTTP ${r2.status}). Check bestfileEmail/bestfilePassword in config.json.`);
   bfLoggedIn = true;
   await bfRefreshCsrf();
@@ -349,6 +421,204 @@ async function bfEnsureLogin() {
   if (!bfLoggedIn) await bfLogin();
   else await bfRefreshCsrf();
 }
+
+// Startup connection check, like Telegram's: try the BestFile login right away
+// so the panel shows connected / Cloudflare-blocked before any upload starts.
+// state: not_configured | checking | connected | blocked | error
+let bfStatus = { state: 'checking', message: 'Checking BestFile login…', checkedAt: null };
+async function bfCheck() {
+  if (!(config.bestfileEmail && config.bestfilePassword) && !String(config.bestfileCookies || '').trim()) {
+    bfStatus = { state: 'not_configured', message: 'bestfileEmail/bestfilePassword not set in config.json', checkedAt: Date.now() };
+    return bfStatus;
+  }
+  bfStatus = { state: 'checking', message: 'Checking BestFile login…', checkedAt: bfStatus.checkedAt };
+  bfLoggedIn = false;
+  try {
+    await Promise.race([
+      bfLogin(),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('BestFile login timed out (30s)')), 30000)),
+    ]);
+    bfStatus = { state: 'connected', message: 'BestFile logged in', checkedAt: Date.now() };
+  } catch (e) {
+    bfLoggedIn = false;
+    const blocked = e.message === BF_CF_HINT;
+    bfStatus = { state: blocked ? 'blocked' : 'error', message: e.message, checkedAt: Date.now() };
+  }
+  return bfStatus;
+}
+bfCheck().then((s) => console.log(s.state === 'connected' ? '✅ BestFile connected' : `❌ BestFile ${s.state}: ${s.message}`));
+
+// Browser login: opens a real Edge/Chrome window on bestfile.io. You click the
+// Cloudflare check there (email/password are auto-filled when the form shows),
+// then the cookies + that browser's User-Agent are saved to config.json and the
+// panel re-checks the connection. Nothing tries to bypass Cloudflare itself.
+const BF_PROFILE_DIR = path.join(__dirname, 'bf-browser-profile');
+const BF_CDP_PORT = 9333; // local Chrome's debugging port, so the same window is reused
+let bfBrowserBusy = false;
+let bfCdpBrowser = null;
+function saveConfig() {
+  const tmp = CONFIG_FILE + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(config, null, 2));
+  fs.renameSync(tmp, CONFIG_FILE);
+}
+function bfChromePath() {
+  const candidates = [
+    path.join(process.env.PROGRAMFILES || 'C:\\Program Files', 'Google\\Chrome\\Application\\chrome.exe'),
+    path.join(process.env['PROGRAMFILES(X86)'] || 'C:\\Program Files (x86)', 'Google\\Chrome\\Application\\chrome.exe'),
+    path.join(process.env.LOCALAPPDATA || '', 'Google\\Chrome\\Application\\chrome.exe'),
+  ];
+  for (const p of candidates) { try { if (p && fs.existsSync(p)) return p; } catch {} }
+  return '';
+}
+// Is our dedicated Chrome already running with its debugging port open?
+function bfCdpUp() {
+  return new Promise((resolve) => {
+    const req = require('http').get({ host: '127.0.0.1', port: BF_CDP_PORT, path: '/json/version', timeout: 1500 }, (res) => {
+      res.resume();
+      resolve(res.statusCode === 200);
+    });
+    req.on('timeout', () => { req.destroy(); resolve(false); });
+    req.on('error', () => resolve(false));
+  });
+}
+// Right half of the primary screen, so the challenge sits beside the panel.
+function bfWindowPlacement() {
+  try {
+    const out = execSync(
+      'powershell -NoProfile -Command "Add-Type -AssemblyName System.Windows.Forms; $b=[System.Windows.Forms.Screen]::PrimaryScreen.Bounds; Write-Output ($b.Width.ToString() + \'x\' + $b.Height.ToString())"',
+      { stdio: 'pipe', timeout: 8000 }
+    ).toString().trim();
+    const [w, h] = out.split('x').map(Number);
+    if (w > 400 && h > 400) {
+      const x = Math.round(w * 0.52);
+      return { x, y: 30, width: Math.max(480, w - x - 20), height: Math.max(600, h - 80) };
+    }
+  } catch {}
+  return { x: 700, y: 40, width: 820, height: 760 };
+}
+// Opens the dedicated Chrome window once (app mode: no tabs, no address bar) and
+// keeps it for later use. Next clicks attach to the same window over CDP instead
+// of opening yet another browser window.
+async function bfOpenBrowser() {
+  const { chromium } = require('playwright-core');
+  if (!(bfCdpBrowser && bfCdpBrowser.isConnected()) && !(await bfCdpUp())) {
+    const exe = bfChromePath();
+    if (!exe) throw new Error('Google Chrome nahi mila. Chrome install karo, ya BestFile untick karke "🔗 BestFile link" use karo.');
+    const { x, y, width, height } = bfWindowPlacement();
+    const child = spawn(exe, [
+      `--user-data-dir=${BF_PROFILE_DIR}`,
+      `--remote-debugging-port=${BF_CDP_PORT}`,
+      '--no-first-run', '--no-default-browser-check',
+      `--window-position=${x},${y}`, `--window-size=${width},${height}`,
+      `--app=https://${BF_HOST}/en/login`,
+    ], { detached: true, stdio: 'ignore' });
+    let launchError;
+    child.once('error', (error) => { launchError = error; });
+    child.unref();
+    const deadline = Date.now() + 20000;
+    while (Date.now() < deadline && !(await bfCdpUp())) await new Promise((r) => setTimeout(r, 400));
+    if (launchError) throw new Error('Chrome start nahi hua: ' + launchError.message);
+    if (!(await bfCdpUp())) {
+      throw new Error('Chrome window khuli lekin panel connect nahi kar paya. Purani "BestFile" Chrome window band karke dobara try karo.');
+    }
+  }
+  if (!bfCdpBrowser || !bfCdpBrowser.isConnected()) {
+    bfCdpBrowser = await chromium.connectOverCDP(`http://127.0.0.1:${BF_CDP_PORT}`);
+  }
+  const ctx = bfCdpBrowser.contexts()[0];
+  if (!ctx) throw new Error('Chrome window ka context nahi mila. Window band karke dobara try karo.');
+  const pages = ctx.pages();
+  let page = pages.find((p) => p.url().includes(BF_HOST)) || pages[0];
+  if (!page) page = await ctx.newPage();
+  return { ctx, page };
+}
+async function bfBrowserLogin() {
+  if (bfHasBrowser()) {
+    await bfBrowserPage.bringToFront().catch(() => {});
+    if (!bfBrowserPage.url().includes(BF_HOST)) {
+      await bfBrowserPage.goto(`https://${BF_HOST}/en/login`, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
+    }
+    const status = await bfCheck();
+    if (status.state === 'connected') return status;
+  }
+  const { ctx, page } = await bfOpenBrowser();
+  bfStatus = { state: 'checking', message: 'BestFile window (panel ke side) mein Cloudflare check par click karo…', checkedAt: Date.now() };
+  let closed = false;
+  bfBrowserContext = ctx;
+  bfBrowserPage = page;
+  const onGone = () => {
+    closed = true;
+    if (bfBrowserContext !== ctx) return;
+    bfBrowserContext = null;
+    bfBrowserPage = null;
+    bfLoggedIn = false;
+    bfStatus = { state: 'error', message: 'BestFile window band ho gayi. "🌐 Browser mein login" dobara dabao.', checkedAt: Date.now() };
+  };
+  ctx.on('close', onGone);
+  page.on('close', onGone);
+  if (bfCdpBrowser) bfCdpBrowser.on('disconnected', onGone);
+  try {
+    await page.bringToFront();
+    if (new URL(page.url()).origin !== `https://${BF_HOST}`) {
+      await page.goto(`https://${BF_HOST}/en/login`, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    }
+    let filled = false;
+    let triedKey = '';
+    const deadline = Date.now() + 5 * 60 * 1000;
+    while (Date.now() < deadline && !closed) {
+      await new Promise((r) => setTimeout(r, 1500));
+      if (closed) break;
+      if (new URL(page.url()).origin !== `https://${BF_HOST}`) continue;
+      const title = await page.title().catch(() => '');
+      if (/just a moment|attention required/i.test(title)) continue; // waiting for your click
+
+      // Cloudflare passed: capture its cookies right away and let the panel make
+      // its own requests with them (cookies + the same browser User-Agent).
+      const cookies = await ctx.cookies(`https://${BF_HOST}`);
+      const signedIn = !/\/login/.test(page.url());
+      const key = cookies.map((c) => c.name + '=' + c.value).sort().join('; ') + '|' + signedIn;
+      if (cookies.length && key !== triedKey) {
+        triedKey = key;
+        config.bestfileCookies = cookies.map((c) => `${c.name}=${c.value}`).join('; ');
+        config.bestfileUserAgent = await page.evaluate(() => navigator.userAgent).catch(() => BF_UA);
+        BF_UA = config.bestfileUserAgent;
+        saveConfig();
+        console.log(`BestFile: captured ${cookies.length} cookies (cf_clearance: ${cookies.some((c) => c.name === 'cf_clearance') ? 'yes' : 'no'}), retrying with them`);
+        const s = await bfCheck();
+        if (s.state === 'connected') return s;
+        // Keep this Chrome window open if another challenge needs your click.
+        bfStatus = { state: 'checking', message: 'Cloudflare cookie mil gayi; ab browser window mein BestFile login complete karo…', checkedAt: Date.now() };
+      }
+
+      // Fallback: HTTP login didn't work, so sign in inside the browser (auto-filled once).
+      if (!filled && config.bestfileEmail && config.bestfilePassword && /\/login/.test(page.url())) {
+        const email = page.locator('input[name="email"]');
+        if (await email.count().catch(() => 0)) {
+          filled = true;
+          await email.fill(config.bestfileEmail).catch(() => {});
+          await page.locator('input[name="password"]').fill(config.bestfilePassword).catch(() => {});
+          await page.locator('form:has(input[name="password"]) [type="submit"]').first().click().catch(() => {});
+          continue;
+        }
+      }
+    }
+    bfStatus = { state: 'error', message: closed ? 'BestFile window band ho gayi, login complete nahi hua.' : 'Browser login 5 minute mein complete nahi hua.', checkedAt: Date.now() };
+    return bfStatus;
+  } catch (e) {
+    // The window stays open: it still holds the Cloudflare session, so retrying is one click.
+    bfStatus = { state: 'error', message: e.message, checkedAt: Date.now() };
+    return bfStatus;
+  }
+}
+const app_bfBrowserLogin = async () => {
+  if (bfBrowserBusy) return { started: false, message: 'Browser login pehle se chal raha hai' };
+  bfBrowserBusy = true;
+  bfStatus = { state: 'checking', message: 'BestFile window panel ke side khul rahi hai — Cloudflare check wahan complete karo.', checkedAt: Date.now() };
+  bfBrowserLogin()
+    .catch((e) => { bfStatus = { state: 'error', message: e.message, checkedAt: Date.now() }; })
+    .finally(() => { bfBrowserBusy = false; console.log(`BestFile browser login: ${bfStatus.state} — ${bfStatus.message}`); });
+  return { started: true };
+};
 
 // Upload one file to BestFile with live progress. Returns { download_id, download_link }.
 async function bfUpload(job, filePath, from, to) {
@@ -395,6 +665,7 @@ async function bfUpload(job, filePath, from, to) {
   });
 
   await bfEnsureLogin();
+  if (bfHasBrowser()) return bfBrowserUpload(filePath, tick, size);
   try {
     return await attempt(bfCsrf);
   } catch (e) {
@@ -403,6 +674,57 @@ async function bfUpload(job, filePath, from, to) {
     await bfLogin();
     return await attempt(bfCsrf);
   }
+}
+
+// Upload through the signed-in Chrome page using a disk-backed file input.
+// Chrome handles the multipart transfer without buffering the video in JS.
+async function bfBrowserUpload(filePath, tick, size) {
+  const page = bfBrowserPage;
+  const fileName = path.basename(filePath);
+  const input = await page.evaluateHandle(() => {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.hidden = true;
+    document.body.appendChild(input);
+    return input;
+  });
+  let res;
+  let progressTimer;
+  try {
+    await input.asElement().setInputFiles(filePath);
+    await page.evaluate(() => { window.__bfUploadProgress = 0; });
+    progressTimer = setInterval(() => {
+      page.evaluate(() => window.__bfUploadProgress || 0)
+        .then((loaded) => tick(Math.min(loaded, Math.max(0, size - 1)), size)).catch(() => {});
+    }, 1000);
+    res = await page.evaluate(({ input, fileName, size, csrf }) => new Promise((resolve, reject) => {
+      if (location.origin !== 'https://bestfile.io') return reject(new Error('BestFile tab changed; login dobara karo.'));
+      const form = new FormData();
+      form.append('file', input.files[0], fileName);
+      form.append('upload_auto_delete', '0');
+      form.append('size', String(size));
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', '/upload');
+      xhr.timeout = 60 * 60 * 1000;
+      xhr.setRequestHeader('X-CSRF-TOKEN', csrf);
+      xhr.setRequestHeader('X-Requested-With', 'XMLHttpRequest');
+      xhr.upload.onprogress = (event) => { window.__bfUploadProgress = event.loaded; };
+      xhr.onload = () => resolve({ status: xhr.status, body: xhr.responseText });
+      xhr.onerror = () => reject(new Error('BestFile browser upload network error'));
+      xhr.ontimeout = () => reject(new Error('BestFile browser upload timed out'));
+      xhr.onabort = () => reject(new Error('BestFile browser upload aborted'));
+      xhr.send(form);
+    }), { input, fileName, size, csrf: bfCsrf });
+  } finally {
+    clearInterval(progressTimer);
+    await input.evaluate((element) => element.remove()).catch(() => {});
+    await input.dispose();
+  }
+  let json;
+  try { json = JSON.parse(res.body); } catch { json = null; }
+  if (json && json.type === 'success') { tick(size, size); return json; }
+  if (json) throw new Error('BestFile upload error: ' + (json.msg || json.error || JSON.stringify(json).slice(0, 200)));
+  throw new Error(`BestFile upload bad response (HTTP ${res.status}): ` + String(res.body).replace(/\s+/g, ' ').slice(0, 200));
 }
 
 // ================= Job: upload =================
@@ -493,24 +815,37 @@ async function doUpload(job, p) {
   }
 
   // ---- BestFile target: video file only ----
+  // A BestFile failure must not throw away the Telegram upload that already
+  // succeeded: report it, finish the job, and let the link be added by hand.
   let bfInfo = null;
   if (hasBf) {
     step(job, 'bestfile', 'running');
     job.stage = '⬆️ Uploading video to BestFile…';
-    bfInfo = await bfUpload(job, finalPath, bfStart, 100);
-    step(job, 'bestfile', 'done');
-    jlog(job, `BestFile upload done → ${bfInfo.download_link}`);
+    try {
+      bfInfo = await bfUpload(job, finalPath, bfStart, 100);
+      step(job, 'bestfile', 'done');
+      jlog(job, `BestFile upload done → ${bfInfo.download_link}`);
+    } catch (e) {
+      bfInfo = null;
+      job.bestfileError = e.message;
+      bfStatus = { state: e.message === BF_CF_HINT ? 'blocked' : 'error', message: e.message, checkedAt: Date.now() };
+      step(job, 'bestfile', 'error');
+      jlog(job, '⚠️ BestFile skipped: ' + e.message);
+      jlog(job, 'Telegram upload continues; add the BestFile link later with the "BestFile link" button.');
+    }
   }
+  const bfDone = !!bfInfo;
 
   // ---- Build metadata (BestFile link lives inside the metadata) ----
   const metadata = {
     t: 'meta', id: `local-${Date.now()}`, title: p.title, description: p.description || '',
-    exclusive: !!p.exclusive, targets,
+    exclusive: !!p.exclusive,
+    targets: bfDone ? targets : targets.filter((t) => t !== 'bestfile'),
     views: 0, likes: 0, shares: 0, likedBy: [], duration,
     createdAt: Math.floor(Date.now() / 1000),
   };
   if (hasTg) { metadata.video = tgInfo.video; metadata.thumbnail = tgInfo.thumbnail; }
-  if (hasBf) {
+  if (bfDone) {
     metadata.bestfile = {
       download_id: bfInfo.download_id, download_link: bfInfo.download_link,
       size: fs.statSync(finalPath).size,
@@ -527,7 +862,10 @@ async function doUpload(job, p) {
 
   localMetadata.unshift({ ...metadata, is_fast_start: true });
   saveMetadata();
-  job.result = { id: metadata.id, targets, telegram: hasTg, bestfile: hasBf };
+  job.result = {
+    id: metadata.id, targets, telegram: hasTg, bestfile: bfDone,
+    ...(job.bestfileError ? { bestfileError: job.bestfileError } : {}),
+  };
 }
 
 // ================= Job: re-process =================
@@ -605,9 +943,16 @@ async function doReprocess(job, videoId) {
   let bfInfo = null;
   if (hasBf) {
     job.stage = '⬆️ Uploading to BestFile…';
-    bfInfo = await bfUpload(job, fixed, hasTg ? 85 : 51, 95);
-    jlog(job, `BestFile re-upload done → ${bfInfo.download_link}`);
+    try {
+      bfInfo = await bfUpload(job, fixed, hasTg ? 85 : 51, 95);
+      jlog(job, `BestFile re-upload done → ${bfInfo.download_link}`);
+    } catch (e) {
+      bfInfo = null;
+      job.bestfileError = e.message;
+      jlog(job, '⚠️ BestFile skipped: ' + e.message);
+    }
   }
+  const bfDone = !!bfInfo;
 
   // 6. update local + Telegram metadata
   step(job, 'meta', 'running');
@@ -620,7 +965,7 @@ async function doReprocess(job, videoId) {
       tg_mime: doc?.mimeType || 'video/mp4', tg_channel: config.videoChannel, tg_msg_id: newMsg.id,
     };
   }
-  if (hasBf) {
+  if (bfDone) {
     updated.bestfile = {
       download_id: bfInfo.download_id, download_link: bfInfo.download_link,
       size: fs.statSync(fixed).size,
@@ -656,7 +1001,10 @@ async function doReprocess(job, videoId) {
     catch (e) { jlog(job, '⚠️ Could not delete old message: ' + e.message); }
     step(job, 'cleanup', 'done');
   }
-  job.result = { newMsgId: newMsg?.id, targets, telegram: hasTg, bestfile: hasBf };
+  job.result = {
+    newMsgId: newMsg?.id, targets, telegram: hasTg, bestfile: bfDone,
+    ...(job.bestfileError ? { bestfileError: job.bestfileError } : {}),
+  };
 }
 
 // ================= Sync =================
@@ -709,7 +1057,16 @@ const upload = multer({
 app.use(express.static(path.join(__dirname, 'public')));
 app.use(express.json());
 
-app.get('/api/health', (req, res) => res.json({ ok: true, data: { status: 'up', ffmpeg: ffmpegAvailable, telegram: tgReady, bestfile: !!(config.bestfileEmail && config.bestfilePassword) } }));
+app.get('/api/health', (req, res) => res.json({ ok: true, data: { status: 'up', ffmpeg: ffmpegAvailable, telegram: tgReady, bestfile: bfStatus.state === 'connected', bestfileStatus: bfStatus } }));
+// Re-run the BestFile login check (e.g. after pasting new bestfileCookies and restarting, or a network change).
+app.post('/api/bestfile/check', async (req, res) => res.json({ ok: true, data: await bfCheck() }));
+// Open a real browser window so you can click the Cloudflare check and sign in.
+app.post('/api/bestfile/browser-login', async (req, res) => {
+  if (!['http://localhost:3000', 'http://127.0.0.1:3000'].includes(req.get('origin'))) {
+    return res.status(403).json({ ok: false, error: 'Open browser login from the local admin panel.' });
+  }
+  res.json({ ok: true, data: await app_bfBrowserLogin() });
+});
 app.get('/api/ffmpeg-status', (req, res) => res.json({ ok: true, data: { available: ffmpegAvailable } }));
 app.get('/api/videos', (req, res) => res.json({ ok: true, data: { videos: localMetadata, nextCursor: null } }));
 app.get('/api/jobs', (req, res) => res.json({ ok: true, data: { jobs: [...jobs.values()].reverse().map(publicJob) } }));
@@ -764,6 +1121,42 @@ app.post('/api/delete/:id', (req, res) => {
   res.json({ ok: true, data: { message: 'Deleted (local list only; Telegram messages untouched)' } });
 });
 
+// Add a BestFile link by hand. Needed when Cloudflare blocks the automated
+// login: the Telegram side of the upload succeeds and the link is filled in
+// afterwards. Updates the local record and edits the Telegram metadata message.
+app.post('/api/bestfile/:id/link', async (req, res) => {
+  const v = localMetadata.find((x) => x.id === req.params.id);
+  if (!v) return res.status(404).json({ ok: false, error: 'Video not found' });
+
+  const link = String((req.body && req.body.download_link) || '').trim();
+  if (!/^https?:\/\/\S+$/i.test(link)) {
+    return res.status(400).json({ ok: false, error: 'Valid http(s) link required' });
+  }
+
+  const idMatch = link.match(/bestfile\.io\/(?:en\/)?([A-Za-z0-9]+)/i);
+  v.bestfile = {
+    download_id: idMatch ? idMatch[1] : (v.bestfile?.download_id || ''),
+    download_link: link,
+    size: v.bestfile?.size || v.video?.tg_size || 0,
+  };
+  if (!Array.isArray(v.targets)) v.targets = ['telegram'];
+  if (!v.targets.includes('bestfile')) v.targets.push('bestfile');
+
+  let telegram = 'skipped (no metadata message id)';
+  try {
+    if (v.meta_msg_id) {
+      const inputMeta = await tg.getInputEntity(config.metaChannel);
+      await tg.editMessage(inputMeta, { message: v.meta_msg_id, text: JSON.stringify(tgMetaOf(v)) });
+      telegram = 'updated';
+    }
+  } catch (e) {
+    telegram = 'failed: ' + e.message;
+  }
+
+  saveMetadata();
+  res.json({ ok: true, data: { video: v, telegram } });
+});
+
 app.post('/api/sync-videos', async (req, res) => {
   try { res.json({ ok: true, data: await syncVideosFromTelegram() }); }
   catch (e) { console.error('Sync error:', e); res.status(500).json({ ok: false, error: e.message }); }
@@ -776,4 +1169,12 @@ app.get('/api/export', (req, res) => {
 
 const PORT = 3000;
 // 127.0.0.1 only: this panel holds your Telegram session, so nobody else on your Wi-Fi may reach it.
-app.listen(PORT, '127.0.0.1', () => console.log(`\n🎬 Intimora Local Admin\n👉 http://localhost:${PORT}\n`));
+app.listen(PORT, '127.0.0.1', () => console.log(`\n🎬 Intimora Local Admin\n👉 http://localhost:${PORT}\n`))
+  .on('error', (e) => {
+    if (e.code === 'EADDRINUSE') {
+      console.error(`\n❌ Port ${PORT} pehle se use mein hai — panel shayad already chal raha hai.\n   http://localhost:${PORT} kholo, ya purani panel window/node process band karke dobara start karo.\n`);
+    } else {
+      console.error('❌ Server start nahi hua:', e.message);
+    }
+    process.exit(1);
+  });
