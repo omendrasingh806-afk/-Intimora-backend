@@ -16,9 +16,14 @@
  */
 
 // === Servers (edit here) ===
+// Each server: { url: "...", php: true/false }
+// php: true  → is server par PHP bhi chal raha hai
+// php: false → sirf Node API, PHP nahi
 const SERVERS = [
-  "https://api-intimora.vercel.app",
-  "https://intimora-api1.vercel.app",
+  { url: "https://intimora-api2.site.je",   php: true  },  // Node API + PHP
+  { url: "http://intimora-api3.site.je",    php: true  },  // Node API + PHP
+  { url: "https://api-intimora.vercel.app", php: false },  // Node API only
+  { url: "https://intimora-api1.vercel.app", php: false },// Node API only
 ];
 
 // === Health state (in-memory) ===
@@ -50,8 +55,8 @@ const STRIP_RESPONSE_HEADERS = new Set([
 function getHealthyServers() {
   const now = Date.now();
   return SERVERS.filter((s) => {
-    if (suspendedUntil[s] && suspendedUntil[s] > now) return false;
-    if (serverHealth[s] === false) return false;
+    if (suspendedUntil[s.url] && suspendedUntil[s.url] > now) return false;
+    if (serverHealth[s.url] === false) return false;
     return true;
   });
 }
@@ -100,9 +105,9 @@ async function healthCheck() {
   console.log(`Health check: ${SERVERS.length} servers`);
 
   const results = await Promise.allSettled(
-    SERVERS.map(async (url) => {
-      const alive = await checkServerHealth(url);
-      return { url, alive };
+    SERVERS.map(async (s) => {
+      const alive = await checkServerHealth(s.url);
+      return { url: s.url, alive };
     })
   );
 
@@ -155,7 +160,8 @@ function sanitizeResponseHeaders(response, serverUrl) {
   });
 }
 
-async function forwardRequest(request, serverUrl, bodyBuffer) {
+async function forwardRequest(request, server, bodyBuffer) {
+  const serverUrl = server.url;
   const incomingUrl = new URL(request.url);
   const targetUrl = new URL(incomingUrl.pathname + incomingUrl.search, serverUrl);
 
@@ -199,9 +205,12 @@ async function readBodyIfPresent(request) {
 
 // === Special endpoints ===
 
-// GET /api/servers — returns list of healthy server URLs
+// GET /api/servers — returns list of healthy servers with php flag
 async function handleServersEndpoint() {
-  const healthy = getHealthyServers();
+  const healthy = getHealthyServers().map((s) => ({
+    server: s.url,
+    php: s.php,
+  }));
   return new Response(
     JSON.stringify({ ok: true, data: { servers: healthy } }),
     {
@@ -214,7 +223,7 @@ async function handleServersEndpoint() {
   );
 }
 
-// GET /api/get-server — returns a single healthy server URL
+// GET /api/get-server — returns a single healthy server URL + php flag
 async function handleGetServerEndpoint() {
   const healthy = getHealthyServers();
   if (healthy.length === 0) {
@@ -229,7 +238,7 @@ async function handleGetServerEndpoint() {
   const server = healthy[roundRobinCursor % healthy.length];
   roundRobinCursor++;
   return new Response(
-    JSON.stringify({ ok: true, data: { server: server } }),
+    JSON.stringify({ ok: true, data: { server: server.url, php: server.php } }),
     {
       status: 200,
       headers: {
@@ -256,10 +265,11 @@ async function routeRequest(request) {
 
   // Try up to SERVERS.length times
   for (let attempt = 0; attempt < SERVERS.length; attempt++) {
-    const serverUrl = getNextServer();
+    const server = getNextServer();
+    const serverUrl = server.url;
 
     try {
-      const response = await forwardRequest(request, serverUrl, bodyBuffer);
+      const response = await forwardRequest(request, server, bodyBuffer);
 
       // Check if suspended response on API route
       if (url.pathname.startsWith("/api/") && [404, 410, 503].includes(response.status)) {
