@@ -54,7 +54,7 @@ app.use(express.urlencoded({ extended: true }));
 // ---- CORS middleware ----
 // Allow specific frontend origins to call APIs directly from browser
 const ALLOWED_ORIGINS = [
-  "https://intimora.new.tg",
+  "https://intimora.net",
   "http://localhost:5173",
 ];
 const vercelUrl = process.env.VERCEL_URL;
