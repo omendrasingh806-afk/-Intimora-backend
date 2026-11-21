@@ -840,6 +840,7 @@ async function doUpload(job, p) {
   const metadata = {
     t: 'meta', id: `local-${Date.now()}`, title: p.title, description: p.description || '',
     exclusive: !!p.exclusive,
+    premium: !!p.premium,
     targets: bfDone ? targets : targets.filter((t) => t !== 'bestfile'),
     views: 0, likes: 0, shares: 0, likedBy: [], duration,
     createdAt: Math.floor(Date.now() / 1000),
@@ -1024,7 +1025,7 @@ async function syncVideosFromTelegram() {
       const va = (d.attributes || []).find((a) => a.className === 'DocumentAttributeVideo');
       found.set(m.id, {
         id: `tg-${m.id}`, title: m.message || d.attributes?.find((a) => a.fileName)?.fileName || 'Untitled', description: '',
-        exclusive: false, duration: va ? Math.round(Number(va.duration)) : 0, views: 0, likes: 0, shares: 0, likedBy: [],
+        exclusive: false, premium: false, duration: va ? Math.round(Number(va.duration)) : 0, views: 0, likes: 0, shares: 0, likedBy: [],
         video: {
           tg_doc_id: String(d.id), tg_access_hash: String(d.accessHash), tg_file_ref: refToBase64(d.fileReference),
           tg_size: Number(d.size), tg_mime: d.mimeType, tg_channel: config.videoChannel, tg_msg_id: m.id,
@@ -1095,7 +1096,7 @@ app.post('/api/upload', upload.fields([{ name: 'video', maxCount: 1 }, { name: '
   if (needsThumb && !t) return bad('Thumbnail required (needed for Telegram upload)');
   const job = createJob('upload', req.body.title, null, targets);
   runJob(job, (j) => doUpload(j, {
-    title: req.body.title, description: req.body.description, exclusive: req.body.exclusive === 'true',
+    title: req.body.title, description: req.body.description, exclusive: req.body.exclusive === 'true', premium: req.body.premium === 'true',
     duration: parseInt(req.body.duration) || 0, videoPath: v.path, thumbPath: t?.path, thumbSize: t?.size || 0, origName: v.originalname,
   }));
   res.json({ ok: true, data: { jobId: job.id, targets } });

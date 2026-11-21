@@ -108,6 +108,7 @@ function publicVideo(v) {
     title: v.title,
     description: v.description,
     exclusive: v.exclusive === true || v.exclusive === 'true',
+    premium: v.premium === true || v.premium === 'true',
     size: v.video?.size,
     mime: v.video?.mime,
     thumbSize: v.thumbnail?.size,

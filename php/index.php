@@ -568,6 +568,7 @@ if ($path === '/api/admin/metadata' && $method === 'POST') {
         'title' => $body['title'] ?? 'Untitled',
         'description' => mb_substr((string) ($body['description'] ?? ''), 0, 1000),
         'exclusive' => (($body['exclusive'] ?? false) === true || ($body['exclusive'] ?? '') === 'true'),
+        'premium' => (($body['premium'] ?? false) === true || ($body['premium'] ?? '') === 'true'),
         'views' => (int) ($body['views'] ?? 0),
         'likes' => (int) ($body['likes'] ?? 0),
         'shares' => (int) ($body['shares'] ?? 0),
@@ -640,6 +641,7 @@ if ($path === '/api/admin/upload' && $method === 'POST') {
     $title = $_POST['title'] ?? 'Untitled';
     $description = $_POST['description'] ?? '';
     $exclusive = (($_POST['exclusive'] ?? '') === 'true');
+    $premium = (($_POST['premium'] ?? '') === 'true');
 
     try {
         $msg = tg_upload_video(TG_CHANNEL_VIDEO, $file['tmp_name'], $title, $file['name']);
@@ -651,6 +653,7 @@ if ($path === '/api/admin/upload' && $method === 'POST') {
             'title' => $title,
             'description' => $description,
             'exclusive' => $exclusive,
+            'premium' => $premium,
             'video' => [
                 'docId' => (string) ($doc['id'] ?? ''),
                 'accessHash' => (string) ($doc['access_hash'] ?? ''),
@@ -721,6 +724,7 @@ if ($path === '/api/admin/sync' && $method === 'POST') {
                     'title' => $msg['message'] ?: $fileName,
                     'description' => '',
                     'exclusive' => false,
+                    'premium' => false,
                     'video' => [
                         'docId' => (string) $doc['id'],
                         'accessHash' => (string) $doc['access_hash'],
