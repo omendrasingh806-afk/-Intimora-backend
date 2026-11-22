@@ -9,6 +9,7 @@ const store = require("./store");
 const tg = require("./telegram");
 const users = require("./users");
 const bestfile = require("./bestfile");
+const premium = require("./premium");
 const phpProxy = require("./phpProxy");
 
 // ---- Firebase Auth — token verification via REST API (no service account key needed) ----
@@ -45,6 +46,16 @@ async function auth(req, res, next) {
   } catch (e) {
     return res.status(401).json({ ok: false, error: "Invalid token" });
   }
+}
+
+// Optional auth: a valid Firebase token gives the uid, no token gives "".
+async function optionalUid(req) {
+  const header = req.headers.authorization || "";
+  if (!header.startsWith("Bearer ")) return "";
+  try {
+    const decoded = await verifyFirebaseToken(header.split(" ")[1]);
+    return decoded.localId || "";
+  } catch { return ""; }
 }
 
 const app = express();
@@ -170,7 +181,8 @@ app.get("/api/videos", async (req, res) => {
     const cursor = parseInt(req.query.cursor, 10) || 0;
     const limit = Math.min(parseInt(req.query.limit, 10) || 12, 50);
     const metas = await store.listVideos(cursor, limit);
-    const videos = metas.map(publicVideo);
+    const uid = await optionalUid(req);
+    const videos = await Promise.all(metas.map((m) => premium.shapeVideo(publicVideo(m), m, uid)));
     const nextCursor = videos.length ? metas[metas.length - 1].createdAt : null;
     ok(res, { videos, nextCursor });
   } catch (e) { fail(res, e.message, 500); }
@@ -183,7 +195,9 @@ app.get("/api/search", async (req, res) => {
     if (!q) return ok(res, { videos: [], nextCursor: null });
     const limit = Math.min(parseInt(req.query.limit, 10) || 12, 50);
     const metas = await store.searchVideos(q);
-    ok(res, { videos: metas.slice(0, limit).map(publicVideo), nextCursor: null });
+    const uid = await optionalUid(req);
+    const videos = await Promise.all(metas.slice(0, limit).map((m) => premium.shapeVideo(publicVideo(m), m, uid)));
+    ok(res, { videos, nextCursor: null });
   } catch (e) { fail(res, e.message, 500); }
 });
 
@@ -194,7 +208,7 @@ app.get("/api/videos/:id", async (req, res) => {
     if (!v) return fail(res, "Video not found", 404);
     v = await store.incrementViews(req.params.id);
     if (!v) return fail(res, "Video not found", 404);
-    ok(res, publicVideo(v));
+    ok(res, await premium.shapeVideo(publicVideo(v), v, await optionalUid(req)));
   } catch (e) { fail(res, e.message, 500); }
 });
 
@@ -223,11 +237,23 @@ app.get("/api/videos/:id/stream", async (req, res) => {
     const v = await store.getVideo(req.params.id);
     if (!v) return fail(res, "Video not found", 404);
 
-    // --- BestFile first: if the video has a BestFile link, redirect to its CDN ---
-    if (v.bestfile && v.bestfile.download_link) {
+    // Premium videos are never served from a bare URL: a signed token is
+    // required and it expires together with premium.
+    const kind = req.query.kind === "trailer" ? "trailer" : "video";
+    if (premium.isPremiumVideo(v)) {
+      if (kind === "trailer" && !premium.hasTrailer(v)) return fail(res, "No trailer for this video", 404);
+      const payload = premium.checkToken(req.query.t, req.params.id, kind);
+      if (!payload) return fail(res, "Link expired — reload the page", 403);
+      if (kind === "video" && Number(payload.p) * 1000 <= Date.now()) return fail(res, "Premium required", 403);
+    }
+    const source = kind === "trailer" ? (v.trailer || {}) : v;
+    const bf = kind === "trailer" ? (source.bestfile || null) : v.bestfile;
+
+    // --- BestFile first: if the file has a BestFile link, redirect to its CDN ---
+    if (bf && bf.download_link) {
       let cdnUrl = null;
       try {
-        cdnUrl = await bestfile.bfGetCdnUrl(v.bestfile.download_link);
+        cdnUrl = await bestfile.bfGetCdnUrl(bf.download_link);
       } catch (e) {
         console.error("bestfile cdn error:", e.message);
       }
@@ -243,9 +269,15 @@ app.get("/api/videos/:id/stream", async (req, res) => {
     }
 
     // BestFile-only videos have no Telegram copy to fall back to.
-    if (!v.video) return fail(res, "No playable source for this video", 404);
+    const hasTgSource = kind === "trailer" ? !!(v.trailer && v.trailer.tg_doc_id) : !!v.video;
+    if (!hasTgSource) return fail(res, "No playable source for this video", 404);
 
-    const streamFormat = store.toStreamFormat(v);
+    const streamFormat = kind === "trailer"
+      ? {
+          tg_doc_id: v.trailer.tg_doc_id, tg_access_hash: v.trailer.tg_access_hash, tg_file_ref: v.trailer.tg_file_ref,
+          tg_size: v.trailer.tg_size, tg_mime: v.trailer.tg_mime || "video/mp4", tg_msg_id: v.trailer.tg_msg_id,
+        }
+      : store.toStreamFormat(v);
     const fileSize = streamFormat.tg_size;
     let start = 0, end = fileSize - 1, status = 200;
 
@@ -452,6 +484,48 @@ app.get("/api/user/referrals", auth, async (req, res) => {
     const tree = await users.getReferralTree(req.userId);
     if (!tree) return fail(res, "User not found", 404);
     ok(res, { tree });
+  } catch (e) { fail(res, e.message, 500); }
+});
+
+// ============================================================
+// PREMIUM ROUTES (referral based)
+// ============================================================
+
+app.get("/api/premium/status", auth, async (req, res) => {
+  try { ok(res, await premium.status(req.userId)); } catch (e) { fail(res, e.message, 500); }
+});
+
+app.get("/api/premium/history", auth, async (req, res) => {
+  try {
+    const h = await premium.history(req.userId);
+    h.status = await premium.status(req.userId);
+    ok(res, h);
+  } catch (e) { fail(res, e.message, 500); }
+});
+
+// Spend referrals: {count: 1} → 2.5h, 2 → 5h, 4 → 10h
+app.post("/api/premium/redeem", auth, async (req, res) => {
+  try {
+    const result = await premium.redeemReferrals(req.userId, req.body.count || 1);
+    if (!result.ok) return fail(res, result.error, result.code || 400);
+    ok(res, { status: result.status, entry: result.entry });
+  } catch (e) { fail(res, e.message, 500); }
+});
+
+app.post("/api/admin/premium/grant", adminAuth, async (req, res) => {
+  try {
+    const r = await premium.grant(req.body.uid, req.body.hours, req.body.source || "admin",
+      req.body.amountPaise || 0, req.body.note || "");
+    if (!r.ok) return fail(res, r.error);
+    ok(res, r);
+  } catch (e) { fail(res, e.message, 500); }
+});
+
+app.get("/api/admin/premium", adminAuth, async (req, res) => {
+  try {
+    const uid = String(req.query.uid || "");
+    if (!uid) return fail(res, "uid required");
+    ok(res, { status: await premium.status(uid), history: await premium.history(uid) });
   } catch (e) { fail(res, e.message, 500); }
 });
 

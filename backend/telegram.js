@@ -40,6 +40,10 @@ function channelReferrals() {
   if (!c) throw new Error("TELEGRAM_CHANNEL_REFERRALS not set");
   return c;
 }
+// Premium ledger — the same append-only channel the PHP backend uses.
+function channelPremium() {
+  return process.env.TELEGRAM_CHANNEL_PREMIUM || process.env.PREMIUM_CHANNEL || "-1004327041194";
+}
 
 let _clientLock = Promise.resolve();
 async function getClient() {
@@ -476,6 +480,7 @@ function buildMetadata(v) {
     likedBy: v.likedBy || [],
     duration: v.duration || 0,
     createdAt: v.created_at || Math.floor(Date.now() / 1000),
+    trailer: v.trailer || null,
     video: {
       docId: v.tg_doc_id,
       accessHash: v.tg_access_hash,
@@ -655,6 +660,7 @@ async function readMessages(channel, limit = 5000) {
 }
 
 module.exports = {
+  channelPremium,
   getClient,
   sendLoginCode,
   verifyLogin,

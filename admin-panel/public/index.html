@@ -185,6 +185,7 @@
     }
     .badge-exclusive { background: #4a148c; color: #ce93d8; }
     .badge-premium { background: #ff6f00; color: #fff3e0; }
+    .badge-trailer { background: #00695c; color: #80cbc4; }
     .badge-public { background: #1b5e20; color: #a5d6a7; }
     .badge-fs { background: #1565c0; color: #90caf9; }
     .badge-bf { background: #e65100; color: #ffcc80; }
@@ -261,6 +262,8 @@
       <input type="file" id="videoFile" accept="video/*">
       <label>Thumbnail (compulsory)</label>
       <input type="file" id="thumbFile" accept="image/*">
+      <label>Trailer (optional — premium videos)</label>
+      <input type="file" id="trailerFile" accept="video/*">
 
       <div class="progress-container" id="progressContainer">
         <div class="progress-header">
@@ -340,6 +343,7 @@ async function loadVideos() {
       const badge = [
         v.exclusive ? '<span class="badge badge-exclusive">🔒 Exclusive</span>' : '',
         v.premium ? '<span class="badge badge-premium">⭐ Premium</span>' : '',
+        v.trailer ? '<span class="badge badge-trailer">🎬 Trailer</span>' : '',
         !v.exclusive && !v.premium ? '<span class="badge badge-public">Public</span>' : '',
       ].filter(Boolean).join(' ');
       const fs = v.is_fast_start === true ? '<span class="badge badge-fs">⚡ Fast-start</span>'
@@ -435,6 +439,8 @@ function uploadVideo() {
   fd.append('exclusive', $('exclusive').value); fd.append('premium', $('premium').value); fd.append('targets', targets.join(','));
   fd.append('video', videoFile);
   if (thumbFile) fd.append('thumb', thumbFile);
+  const trailerFile = $('trailerFile').files[0];
+  if (trailerFile) fd.append('trailer', trailerFile);
 
   $('progressContainer').style.display = 'block';
   $('progressStep').textContent = 'Copying to local server…';
@@ -453,7 +459,7 @@ function uploadVideo() {
       const d = JSON.parse(xhr.responseText);
       if (!d.ok) return showStatus('Error: ' + d.error, 'error');
       showStatus('Upload started — watch live progress in "Jobs" below ⬇️', 'info');
-      ['title', 'description', 'duration', 'videoFile', 'thumbFile'].forEach(i => $(i).value = '');
+      ['title', 'description', 'duration', 'videoFile', 'thumbFile', 'trailerFile'].forEach(i => $(i).value = '');
       $('tgTarget').checked = true; $('bfTarget').checked = true; updateUploadBtn();
       $('exclusive').value = 'false';
       $('premium').value = 'false';
