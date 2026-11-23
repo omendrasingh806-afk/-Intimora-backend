@@ -280,6 +280,7 @@ app.get("/api/videos/:id/stream", async (req, res) => {
       : store.toStreamFormat(v);
     const fileSize = streamFormat.tg_size;
     let start = 0, end = fileSize - 1, status = 200;
+    const OPEN_RANGE_CHUNK = 8 * 1024 * 1024; // 8 MB per open-ended response
 
     const range = req.headers.range;
     if (range) {
@@ -289,6 +290,12 @@ app.get("/api/videos/:id/stream", async (req, res) => {
           // bytes=start-end or bytes=start-
           start = parseInt(m[1], 10);
           end = m[2] ? parseInt(m[2], 10) : fileSize - 1;
+          if (!m[2]) {
+            // Open-ended range (the player asks "bytes=0-"): answer with one
+            // capped chunk and let the player ask for the next one. A whole
+            // 300 MB file cannot be pushed through a 60 s serverless limit.
+            end = Math.min(end, start + OPEN_RANGE_CHUNK - 1);
+          }
         } else if (m[2]) {
           // bytes=-suffix → last N bytes
           const suffix = parseInt(m[2], 10);
@@ -352,6 +359,10 @@ app.get("/api/videos/:id/stream", async (req, res) => {
     });
     if (status === 206) res.set("Content-Range", `bytes ${start}-${end}/${fileSize}`);
 
+    // Send the headers now: a serverless host kills the invocation if the
+    // first byte takes too long, and the player should know the stream started.
+    if (typeof res.flushHeaders === "function") res.flushHeaders();
+
     for await (const chunk of tg.streamRange(streamFormat, start, end)) {
       if (!res.write(chunk)) {
         await new Promise((r) => res.once("drain", r));
@@ -359,8 +370,10 @@ app.get("/api/videos/:id/stream", async (req, res) => {
     }
     res.end();
   } catch (e) {
-    try { res.end(); } catch {}
     console.error("stream error:", e.message);
+    // Content-Length is already promised, so ending cleanly would leave the
+    // client waiting for the rest of the file. Abort the response instead.
+    try { res.destroy(e); } catch {}
   }
 });
 

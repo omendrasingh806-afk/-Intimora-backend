@@ -217,16 +217,18 @@ function makePhotoLocation(docId, accessHash, fileRef, thumbSize = "") {
   });
 }
 
-// Refresh expired file reference for a document (video)
-async function refreshDocFileRef(docId, accessHash) {
+// Refresh expired file reference for a document (video).
+// This teleproto build has no messages.getDocument, so the message itself is
+// re-fetched and its document (with a fresh file_reference) is used.
+async function refreshDocFileRef(docId, accessHash, msgId) {
   const client = await getClient();
-  const doc = await client.invoke(new Api.messages.GetDocument({
-    document: new Api.InputDocument({
-      id: BigInt(docId),
-      accessHash: BigInt(accessHash),
-    }),
-  }));
-  return doc.document.fileReference;
+  if (msgId) {
+    const messages = await client.getMessages(channelVideo(), { ids: [Number(msgId)] });
+    const msg = Array.isArray(messages) ? messages[0] : messages;
+    const doc = msg && (msg.document || (msg.media && msg.media.document));
+    if (doc && doc.fileReference) return Buffer.from(doc.fileReference);
+  }
+  return null;
 }
 
 // Refresh expired file reference for a photo (thumbnail)
@@ -247,14 +249,28 @@ async function refreshPhotoFileRef(photoId, accessHash, fileRef) {
 
 // fetch a single 512 KB part from Telegram (GetFile limit is 512KB)
 async function getFileChunk(client, video, offset, limit) {
-  const res = await client.invoke(new Api.upload.GetFile({
+  const fetchPart = () => client.invoke(new Api.upload.GetFile({
     location: makeDocLocation(video.tg_doc_id, video.tg_access_hash, video.tg_file_ref, ""),
     offset: BigInt(offset),
     limit,
     precise: false,
     cdnSupported: false,
   }));
-  return res.bytes || Buffer.alloc(0);
+
+  try {
+    const res = await fetchPart();
+    return res.bytes || Buffer.alloc(0);
+  } catch (e) {
+    // Stored file references expire (Telegram rotates them). Re-fetch the
+    // message once and retry instead of failing the stream.
+    if (!/file reference/i.test(String(e && e.message)) || !video.tg_msg_id) throw e;
+    const fresh = await refreshDocFileRef(video.tg_doc_id, video.tg_access_hash, video.tg_msg_id);
+    if (!fresh) throw e;
+    video.tg_file_ref = fresh.toString("base64");
+    console.log("[getFileChunk] refreshed expired file ref");
+    const res = await fetchPart();
+    return res.bytes || Buffer.alloc(0);
+  }
 }
 
 // Stream a byte range [start, end] as an async generator of Buffers.
@@ -289,7 +305,7 @@ async function* streamRange(video, start, end) {
 
   // Fallback: use upload.GetFile with refreshed file reference
   try {
-    const freshRef = await refreshDocFileRef(video.tg_doc_id, video.tg_access_hash);
+    const freshRef = await refreshDocFileRef(video.tg_doc_id, video.tg_access_hash, video.tg_msg_id);
     if (freshRef) {
       video.tg_file_ref = refToBase64(freshRef);
       console.log("[streamRange] refreshed video file ref");
@@ -377,7 +393,8 @@ async function findMoovAtom(video) {
   // Fetch parts in parallel
   const promises = [];
   for (let offset = alignedStart; offset < fileSize; offset += PART) {
-    const limit = Math.min(PART, fileSize - offset);
+    // Telegram only accepts limits that are multiples of 4096.
+    const limit = Math.min(PART, Math.ceil((fileSize - offset) / 4096) * 4096);
     promises.push(getFileChunk(client, video, offset, limit));
   }
   const parts = await Promise.all(promises);
@@ -412,7 +429,9 @@ async function findMoovAtom(video) {
 async function readFileRange(video, start, end) {
   const client = await getClient();
   const alignedStart = Math.floor(start / PART) * PART;
-  const limit = Math.min(PART, end - alignedStart + 1);
+  // Telegram rejects limits that are not a multiple of 4096, so ask for a
+  // part-aligned window and trim afterwards.
+  const limit = Math.min(PART, Math.ceil((end - alignedStart + 1) / 4096) * 4096);
   const bytes = await getFileChunk(client, video, alignedStart, limit);
   let headDiscard = start - alignedStart;
   let result = bytes.subarray(headDiscard);
