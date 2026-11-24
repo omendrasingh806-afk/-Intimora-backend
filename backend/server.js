@@ -63,26 +63,20 @@ app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true }));
 
 // ---- CORS middleware ----
-// Allow specific frontend origins to call APIs directly from browser
-const ALLOWED_ORIGINS = [
-  "https://intimora.net",
-  "http://localhost:5173",
-];
-const vercelUrl = process.env.VERCEL_URL;
-if (vercelUrl) ALLOWED_ORIGINS.push(`https://${vercelUrl}`);
-
+// These endpoints carry no cookies (a caller proves itself with a Bearer token),
+// so the answer echoes whatever origin asked — the same rule the PHP backend
+// uses. A fixed allowlist silently broke every other frontend host (www, a
+// preview domain), which the browser reports as a failed request.
 app.use((req, res, next) => {
   const origin = req.headers.origin;
-  if (origin && (ALLOWED_ORIGINS.includes(origin) || ALLOWED_ORIGINS.includes(origin.replace(/^https?:\/\//, 'https://')))) {
-    res.set({
-      "Access-Control-Allow-Origin": origin,
-      "Vary": "Origin",
-      "Access-Control-Allow-Methods": "GET, POST, HEAD, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type, Authorization, Range, If-Range",
-      "Access-Control-Max-Age": "86400",
-      "Access-Control-Expose-Headers": "Accept-Ranges, Content-Range, Content-Length, Content-Type, ETag",
-    });
-  }
+  res.set({
+    "Access-Control-Allow-Origin": origin || "*",
+    "Vary": "Origin",
+    "Access-Control-Allow-Methods": "GET, POST, HEAD, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization, Range, If-Range",
+    "Access-Control-Max-Age": "86400",
+    "Access-Control-Expose-Headers": "Accept-Ranges, Content-Range, Content-Length, Content-Type, ETag",
+  });
   // Handle OPTIONS preflight — empty 204, no HTML
   if (req.method === "OPTIONS") return res.status(204).end();
   next();
