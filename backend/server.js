@@ -238,12 +238,13 @@ app.get("/api/videos/:id/stream", async (req, res) => {
     if (!v) return fail(res, "Video not found", 404);
 
     // Premium videos are never served from a bare URL: a signed token is
-    // required and it expires together with premium.
+    // required. The link never expires; for a full video the premium end time
+    // carried inside the token decides whether it may play.
     const kind = req.query.kind === "trailer" ? "trailer" : "video";
     if (premium.isPremiumVideo(v)) {
       if (kind === "trailer" && !premium.hasTrailer(v)) return fail(res, "No trailer for this video", 404);
       const payload = premium.checkToken(req.query.t, req.params.id, kind);
-      if (!payload) return fail(res, "Link expired — reload the page", 403);
+      if (!payload) return fail(res, "Invalid link — reload the page", 403);
       if (kind === "video" && Number(payload.p) * 1000 <= Date.now()) return fail(res, "Premium required", 403);
     }
     const source = kind === "trailer" ? (v.trailer || {}) : v;

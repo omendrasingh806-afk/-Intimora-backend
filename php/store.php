@@ -18,7 +18,28 @@ if (!defined('INTIMORA_STORE')) {
 define('INTIMORA_STORE', true);
 
 require_once __DIR__ . '/config.php';
+require_once __DIR__ . '/fastcache.php';
 require_once __DIR__ . '/telegram.php';
+
+// How long the channel history is kept on disk (seconds). Writes clear it.
+// A short TTL made every new visitor wait for a full Telegram re-read, because
+// the first request after the TTL paid seconds of MTProto round trips.
+if (!defined('STORE_DISK_TTL')) {
+    define('STORE_DISK_TTL', 3600);
+}
+// After the TTL the cached copy is still served immediately (stale-while-
+// revalidate) and only refreshed in the background, so no visitor ever waits.
+if (!defined('STORE_DISK_STALE')) {
+    define('STORE_DISK_STALE', 604800);
+}
+// Fresh reads: the metadata is read from Telegram on every request instead of
+// being served from disk. The old disk cache could answer with an older copy of
+// the channel (a video showing wrong/missing data, then correct on the next
+// request). The per-request array below still de-duplicates the work inside one
+// request, so a request never reads the same channel twice.
+if (!defined('STORE_FRESH_READS')) {
+    define('STORE_FRESH_READS', true);
+}
 
 // === In-Memory Cache (one request lifetime) ===
 $_storeCache = [
@@ -27,37 +48,112 @@ $_storeCache = [
     'referrals' => ['data' => null, 'time' => 0],
 ];
 
+// Types that were served stale in this request and need a background refresh.
+$_storeStale = [];
+// id => record lookup, built once per request (store_get_video was a scan).
+$_storeVideoIndex = null;
+// How many new messages one background refresh may pull from Telegram.
+if (!defined('STORE_REFRESH_MAX_PAGES')) {
+    define('STORE_REFRESH_MAX_PAGES', 5);
+}
+
 function store_cache($type, $data) {
-    global $_storeCache;
+    global $_storeCache, $_storeVideoIndex, $_storeStale;
+    if ($type === 'videos') {
+        $_storeVideoIndex = null;
+    }
+    unset($_storeStale[$type]);
     if (!isset($_storeCache[$type])) {
         $_storeCache[$type] = ['data' => null, 'time' => 0];
     }
     $_storeCache[$type]['data'] = $data;
     $_storeCache[$type]['time'] = time();
+
+    // Persist across requests only when fresh reads are disabled.
+    if (!STORE_FRESH_READS) {
+        fc_set('store_' . $type, $data);
+    }
 }
 
 function store_get_cache($type) {
-    global $_storeCache;
-    if (!isset($_storeCache[$type]['data']) || $_storeCache[$type]['data'] === null) {
+    global $_storeCache, $_storeStale;
+
+    if (isset($_storeCache[$type]['data']) && $_storeCache[$type]['data'] !== null) {
+        if ((time() - $_storeCache[$type]['time']) < STORE_DISK_TTL) {
+            return $_storeCache[$type]['data'];
+        }
+    }
+
+    // Always ask Telegram for the current channel contents.
+    if (STORE_FRESH_READS) {
         return null;
     }
-    if ((time() - $_storeCache[$type]['time']) >= 60) {
+
+    $age = fc_age('store_' . $type);
+    if ($age === null || $age >= STORE_DISK_STALE) {
         return null;
     }
-    return $_storeCache[$type]['data'];
+
+    // Fresh or stale: read the cached copy once, no Telegram round trip.
+    $fromDisk = fc_peek('store_' . $type);
+    if (!is_array($fromDisk)) {
+        return null;
+    }
+    if (!isset($_storeCache[$type])) {
+        $_storeCache[$type] = ['data' => null, 'time' => 0];
+    }
+    $_storeCache[$type]['data'] = $fromDisk;
+    $_storeCache[$type]['time'] = time() - $age;
+
+    if ($age >= STORE_DISK_TTL) {
+        $_storeStale[$type] = true;
+    }
+    return $fromDisk;
+}
+
+// Is any cached list stale (so the request should schedule a background refresh)?
+function store_has_stale() {
+    global $_storeStale;
+    return !empty($_storeStale);
+}
+
+// Refresh the lists that were served stale. Runs after the response left the
+// server (see json_ok in index.php), so the visitor never waits for Telegram.
+function store_refresh_stale() {
+    global $_storeStale;
+    $types = array_keys((array) $_storeStale);
+    $_storeStale = [];
+    foreach ($types as $type) {
+        try {
+            if ($type === 'videos') {
+                store_refresh_videos();
+            } elseif ($type === 'users') {
+                store_read_users(true);
+            } elseif ($type === 'referrals') {
+                store_read_referrals(true);
+            }
+        } catch (\Throwable $e) {
+            // a failed refresh just leaves the stale copy in place
+        }
+    }
 }
 
 function store_clear_cache($type = null) {
-    global $_storeCache;
+    global $_storeCache, $_storeVideoIndex, $_storeStale;
+    $_storeVideoIndex = null;
     if ($type) {
+        unset($_storeStale[$type]);
         if (isset($_storeCache[$type])) {
             $_storeCache[$type]['data'] = null;
             $_storeCache[$type]['time'] = 0;
         }
+        fc_forget('store_' . $type);
     } else {
+        $_storeStale = [];
         foreach (array_keys($_storeCache) as $key) {
             $_storeCache[$key]['data'] = null;
             $_storeCache[$key]['time'] = 0;
+            fc_forget('store_' . $key);
         }
     }
 }
@@ -80,8 +176,8 @@ function store_field($arr, $camel, $snake, $default = null) {
 
 // Convert a stored metadata record into the flat tg_* format the MTProto
 // download helpers (mtproto_media) expect.
-function store_to_stream_format($m) {
-    $video = $m['video'] ?? [];
+function store_to_stream_format($m, $kind = 'video') {
+    $video = $kind === 'trailer' ? ($m['trailer'] ?? []) : ($m['video'] ?? []);
     $thumb = $m['thumbnail'] ?? [];
 
     return [
@@ -93,7 +189,9 @@ function store_to_stream_format($m) {
         'tg_dc_id' => (int) store_field($video, 'dcId', 'tg_dc_id', 0),
         'tg_msg_id' => (int) store_field($video, 'msgId', 'tg_msg_id', 0),
         'tg_filename' => (string) store_field($video, 'filename', 'tg_filename', 'video.mp4'),
-        'tg_channel' => $m['video']['channel'] ?? ($m['tg_channel'] ?? TG_CHANNEL_VIDEO),
+        'tg_channel' => $kind === 'trailer'
+            ? (string) store_field($m['trailer'] ?? [], 'channel', 'tg_channel', TG_CHANNEL_VIDEO)
+            : ($m['video']['channel'] ?? ($m['tg_channel'] ?? TG_CHANNEL_VIDEO)),
         'thumb_doc_id' => (string) store_field($thumb, 'docId', 'thumb_doc_id', ''),
         'thumb_access_hash' => (string) store_field($thumb, 'accessHash', 'thumb_access_hash', ''),
         'thumb_file_ref' => (string) store_field($thumb, 'fileRef', 'thumb_file_ref', ''),
@@ -114,6 +212,8 @@ function store_public_video($v) {
         'description' => $v['description'] ?? '',
         'exclusive' => (($v['exclusive'] ?? false) === true || ($v['exclusive'] ?? '') === 'true'),
         'premium' => (($v['premium'] ?? false) === true || ($v['premium'] ?? '') === 'true'),
+        'hasTrailer' => is_array($v['trailer'] ?? null) && (!empty($v['trailer']['docId']) || !empty($v['trailer']['tg_doc_id'])),
+        'trailerSize' => (int) ($v['trailer']['size'] ?? $v['trailer']['tg_size'] ?? 0),
         'size' => isset($video['size']) ? (int) $video['size'] : (isset($video['tg_size']) ? (int) $video['tg_size'] : null),
         'mime' => store_field($video, 'mime', 'tg_mime', 'video/mp4'),
         'thumbSize' => isset($thumb['size']) ? (int) $thumb['size'] : (isset($thumb['thumb_size']) ? (int) $thumb['thumb_size'] : 0),
@@ -225,11 +325,25 @@ function store_parse_meta_message($msg) {
     return $data;
 }
 
+// Newest Telegram message id in a stored video list (0 when unknown).
+function store_newest_msg_id($videos) {
+    $newest = 0;
+    foreach ((array) $videos as $v) {
+        $id = (int) ($v['_msgId'] ?? 0);
+        if ($id > $newest) {
+            $newest = $id;
+        }
+    }
+    return $newest;
+}
+
 // All video metadata, newest first
-function store_read_videos() {
-    $cached = store_get_cache('videos');
-    if ($cached !== null) {
-        return $cached;
+function store_read_videos($force = false) {
+    if (!$force) {
+        $cached = store_get_cache('videos');
+        if ($cached !== null) {
+            return $cached;
+        }
     }
 
     $videos = [];
@@ -246,6 +360,64 @@ function store_read_videos() {
 
     store_cache('videos', $videos);
     return $videos;
+}
+
+// Background refresh: pull only the messages newer than the cached newest one.
+// The old cached list stays in place, so this is a few round trips instead of
+// re-reading the whole channel (which was the multi-second part).
+function store_refresh_videos() {
+    if (STORE_FRESH_READS) {
+        store_read_videos(true);
+        return;
+    }
+
+    $old = fc_peek('store_videos');
+    if (!is_array($old) || !$old) {
+        store_read_videos(true);
+        return;
+    }
+
+    $newestId = store_newest_msg_id($old);
+    $fresh = [];
+    $offsetId = 0;
+    $done = false;
+
+    for ($page = 0; $page < STORE_REFRESH_MAX_PAGES && !$done; $page++) {
+        $messages = tg_get_history(TG_CHANNEL_META, 200, $offsetId);
+        if (empty($messages)) {
+            break;
+        }
+
+        foreach ($messages as $msg) {
+            $id = (int) ($msg['id'] ?? 0);
+            if ($newestId > 0 && $id <= $newestId) {
+                $done = true;
+                break;
+            }
+            $parsed = store_parse_meta_message($msg);
+            if ($parsed !== null) {
+                $fresh[] = $parsed;
+            }
+        }
+
+        $oldest = (int) ($messages[count($messages) - 1]['id'] ?? 0);
+        if ($oldest <= 0 || $oldest === $offsetId) {
+            break;
+        }
+        $offsetId = $oldest;
+    }
+
+    if (!$fresh) {
+        // Nothing new: only bump the cache timestamp, no re-sorting needed.
+        store_cache('videos', $old);
+        return;
+    }
+
+    $merged = array_merge($fresh, $old);
+    usort($merged, function ($a, $b) {
+        return ((int) ($b['createdAt'] ?? 0)) <=> ((int) ($a['createdAt'] ?? 0));
+    });
+    store_cache('videos', $merged);
 }
 
 // Legacy name kept for existing callers
@@ -289,16 +461,52 @@ function store_search_videos($query) {
     return $matches;
 }
 
-function store_get_video($videoId) {
-    foreach (store_read_videos() as $v) {
-        if ((string) ($v['id'] ?? '') === (string) $videoId) {
-            return $v;
-        }
+// id => record map, built once per request
+function store_video_index() {
+    global $_storeVideoIndex;
+    if (is_array($_storeVideoIndex)) {
+        return $_storeVideoIndex;
     }
-    return null;
+    $_storeVideoIndex = [];
+    foreach (store_read_videos() as $v) {
+        $_storeVideoIndex[(string) ($v['id'] ?? '')] = $v;
+    }
+    return $_storeVideoIndex;
+}
+
+function store_get_video($videoId) {
+    $index = store_video_index();
+    $key = (string) $videoId;
+    return $index[$key] ?? null;
 }
 
 // === Video writes ===
+
+// Trailer block for the metadata message (video + trailer live in one message).
+function store_build_trailer($t) {
+    if (!is_array($t)) {
+        return null;
+    }
+    $docId = (string) store_field($t, 'docId', 'tg_doc_id', '');
+    $bfLink = (string) ($t['bestfile']['download_link'] ?? '');
+    if ($docId === '' && $bfLink === '') {
+        return null;
+    }
+    return [
+        'docId' => $docId,
+        'accessHash' => (string) store_field($t, 'accessHash', 'tg_access_hash', ''),
+        'fileRef' => (string) store_field($t, 'fileRef', 'tg_file_ref', ''),
+        'size' => (int) store_field($t, 'size', 'tg_size', 0),
+        'mime' => (string) store_field($t, 'mime', 'tg_mime', 'video/mp4'),
+        'msgId' => (int) store_field($t, 'msgId', 'tg_msg_id', 0),
+        'filename' => (string) store_field($t, 'filename', 'tg_filename', 'trailer.mp4'),
+        'bestfile' => [
+            'download_id' => (string) ($t['bestfile']['download_id'] ?? ''),
+            'download_link' => $bfLink,
+            'size' => (int) ($t['bestfile']['size'] ?? 0),
+        ],
+    ];
+}
 
 // Same object shape as buildMetadata() in backend/telegram.js
 function store_build_metadata($v) {
@@ -312,6 +520,7 @@ function store_build_metadata($v) {
         'description' => mb_substr((string) ($v['description'] ?? ''), 0, 1000),
         'exclusive' => (($v['exclusive'] ?? false) === true || ($v['exclusive'] ?? '') === 'true'),
         'premium' => (($v['premium'] ?? false) === true || ($v['premium'] ?? '') === 'true'),
+        'trailer' => store_build_trailer($v['trailer'] ?? null),
         'views' => (int) ($v['views'] ?? 0),
         'likes' => (int) ($v['likes'] ?? 0),
         'shares' => (int) ($v['shares'] ?? 0),
@@ -381,12 +590,23 @@ function store_update_video_stats($videoId, $updates) {
         return null;
     }
 
+    // Keep the cached list around: store_edit_metadata() clears it, and
+    // re-reading the whole channel from Telegram for one view/like would make
+    // every following request slow again.
+    $list = store_read_videos();
+
     $data = array_merge($msg, $updates);
     unset($data['_msgId']);
 
     store_edit_metadata($msg['_msgId'], $data);
     $data['_msgId'] = $msg['_msgId'];
-    store_cache_patch_video($videoId, $data);
+
+    foreach ($list as $i => $v) {
+        if ((string) ($v['id'] ?? '') === (string) $videoId) {
+            $list[$i] = $data;
+        }
+    }
+    store_cache('videos', $list);
 
     return $data;
 }
@@ -502,10 +722,12 @@ function store_delete_video($videoId) {
 
 // === Users ===
 
-function store_read_users() {
-    $cached = store_get_cache('users');
-    if ($cached !== null) {
-        return $cached;
+function store_read_users($force = false) {
+    if (!$force) {
+        $cached = store_get_cache('users');
+        if ($cached !== null) {
+            return $cached;
+        }
     }
 
     $users = [];
@@ -702,10 +924,12 @@ function store_get_saved_videos($uid) {
 
 // === Referrals ===
 
-function store_read_referrals() {
-    $cached = store_get_cache('referrals');
-    if ($cached !== null) {
-        return $cached;
+function store_read_referrals($force = false) {
+    if (!$force) {
+        $cached = store_get_cache('referrals');
+        if ($cached !== null) {
+            return $cached;
+        }
     }
 
     $referrals = [];

@@ -18,6 +18,14 @@ define('TG_CHANNEL_THUMB', '-1004360811639');
 define('TG_CHANNEL_META', '-1003777974779');
 define('TG_CHANNEL_USERS', '-1004368963146');
 define('TG_CHANNEL_REFERRALS', '-1004451213988');
+define('TG_CHANNEL_PREMIUM', '-1004327041194');
+
+// === Premium ===
+// Append-only ledger lives in TG_CHANNEL_PREMIUM. PREMIUM_SECRET signs the
+// short-lived stream links; it must match the Vercel backend's PREMIUM_SECRET.
+if (!defined('PREMIUM_SECRET')) {
+    define('PREMIUM_SECRET', 'im_prem_7c1f9a24db6e8053');
+}
 
 // === MySQL (EDIT THESE 2 VALUES ONLY) ===
 // Get from: InfinityFree Dashboard → MySQL Databases
@@ -33,12 +41,6 @@ define('FIREBASE_AUTH_DOMAIN', 'intimora-app.firebaseapp.com');
 // === Admin ===
 define('ADMIN_API_KEY', 'Prashant');
 
-// === BestFile (video hosting — sign-in via email) ===
-define('BESTFILE_EMAIL', 'pr3095079@gmail.com');
-define('BESTFILE_PASSWORD', 'noida123');
-define('BESTFILE_HOST', 'bestfile.io');
-define('BESTFILE_SESSION_FILE', sys_get_temp_dir() . '/intimora_bestfile_session.json');
-
 // === Site ===
 define('SITE_URL', 'https://intimora-api2.site.je');
 
@@ -53,3 +55,27 @@ if (!is_dir($cacheDir)) {
 // === FFmpeg (InfinityFree does NOT have ffmpeg — will be skipped) ===
 define('FFMPEG_PATH', '/usr/bin/ffmpeg');
 define('FFPROBE_PATH', '/usr/bin/ffprobe');
+
+// === BestFile (video hosting — sign-in via email) ===
+define('BESTFILE_EMAIL', 'pr3095079@gmail.com');
+define('BESTFILE_PASSWORD', 'noida123');
+define('BESTFILE_HOST', 'bestfile.io');
+define('BESTFILE_SESSION_FILE', sys_get_temp_dir() . '/intimora_bestfile_session.json');
+
+
+
+// === Visitor log (MySQL) ===
+// New-visitor details (IP, country/city, browser, device) are written to the
+// `visitor_logs` table. This hosting does not grant SHOW DATABASES, so the
+// database name is written out explicitly. Accounts are tried in order; the
+// first one that opens its database is used.
+if (!defined('VISITOR_RETENTION_DAYS')) {
+    define('VISITOR_DB_ACCOUNTS', [
+        ['host' => 'sql310.infinityfree.com', 'port' => 3306, 'user' => 'if0_43413402', 'pass' => 'jGuhBV4XZ5', 'name' => 'if0_43413402_intimora'],
+        ['host' => 'sql302.infinityfree.com', 'port' => 3306, 'user' => 'if0_43425423', 'pass' => 'z5DZGLSl9cyOEr', 'name' => 'if0_43425423_intimora'],
+    ]);
+    // Salt for the stored IP hash (plain address and hash stay unlinkable).
+    define('VISITOR_IP_SALT', 'im_7f3c1d9a4b6e8025');
+    // Rows older than this are deleted once a day, in batches.
+    define('VISITOR_RETENTION_DAYS', 90);
+}

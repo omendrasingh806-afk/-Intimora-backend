@@ -28,16 +28,24 @@
 //   GET  /api/admin/export              (x-api-key)
 
 require_once __DIR__ . '/config.php';
+require_once __DIR__ . '/fastcache.php';
 require_once __DIR__ . '/store.php';
+require_once __DIR__ . '/premium.php';
 require_once __DIR__ . '/telegram.php';
 require_once __DIR__ . '/bestfile.php';
+require_once __DIR__ . '/visitor.php';
 
 // === CORS ===
-header('Access-Control-Allow-Origin: *');
+$allowed = ['https://intimora.net', 'https://intimora.tg'];
+$origin  = $_SERVER['HTTP_ORIGIN'] ?? '';
+if (in_array($origin, $allowed, true)) {
+  header("Access-Control-Allow-Origin: $origin");
+  header('Access-Control-Allow-Credentials: true');
+  header('Vary: Origin');
+}
+header('Access-Control-Allow-Headers: Authorization, Content-Type, Range, If-Range, X-Api-Key');
 header('Access-Control-Allow-Methods: GET, POST, HEAD, OPTIONS');
-header('Access-Control-Allow-Headers: Content-Type, Authorization, Range, If-Range, X-Api-Key, X-Admin-Key');
 header('Access-Control-Expose-Headers: Accept-Ranges, Content-Range, Content-Length, Content-Type, ETag');
-header('Access-Control-Max-Age: 86400');
 
 $method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
 
@@ -46,11 +54,176 @@ if ($method === 'OPTIONS') {
     exit;
 }
 
+// === One-time unlock =========================================================
+// The hosting security challenge sets __test without SameSite=None, so the
+// browser never sends it on cross-site requests from the frontend domain.
+// Here the same cookie is re-issued as SameSite=None; Secure, which makes it
+// usable from https://intimora.net (fetch with credentials: "include").
+// Must stay here, before the /api path normalisation below.
+if (str_starts_with($_SERVER['REQUEST_URI'] ?? '/', '/__unlock')) {
+    $back   = (string) ($_GET['back'] ?? '');
+    $host   = parse_url($back, PHP_URL_HOST) ?: '';
+    $scheme = parse_url($back, PHP_URL_SCHEME) ?: '';
+    $okBack = $scheme === 'https' && in_array($host, ['intimora.net', 'intimora.tg'], true);
+
+    $token = $_COOKIE['__test'] ?? '';
+    if ($token !== '') {
+        // Don't wait for PHP to flush the body; this is a redirect only.
+        setcookie('__test', $token, [
+            'expires'  => time() + 21600,
+            'path'     => '/',
+            'secure'   => true,
+            'httponly' => false,
+            'samesite' => 'None',
+        ]);
+    }
+
+    $dest = $okBack
+        ? $back
+        : 'https://intimora.net/?__unlocked=0';
+    if ($okBack && strpos($dest, '__unlocked=') === false) {
+        $dest .= (strpos($dest, '?') === false ? '?' : '&') . '__unlocked=1';
+    }
+    header('Location: ' . $dest, true, 302);
+    exit;
+}
+
+header('Content-Type: application/json; charset=utf-8');
+
 // === JSON helpers ===
 
+// Routes that may be cached by the browser/CDN set a TTL here (seconds).
+$PUBLIC_CACHE_TTL = 0;
+
+// Work that runs after the response has been flushed to the client.
+$AFTER_RESPONSE = null;
+
+function after_response($fn) {
+    global $AFTER_RESPONSE;
+    $AFTER_RESPONSE = $fn;
+}
+
+function flush_and_detach() {
+    if (function_exists('fastcgi_finish_request')) {
+        fastcgi_finish_request();
+        return;
+    }
+    while (ob_get_level() > 0) {
+        @ob_end_flush();
+    }
+    @flush();
+}
+
+function thumbs_payload($stream) {
+    return [
+        'tg_doc_id' => $stream['thumb_doc_id'],
+        'tg_access_hash' => $stream['thumb_access_hash'],
+        'tg_file_ref' => $stream['thumb_file_ref'],
+        'tg_size' => $stream['thumb_size'],
+        'tg_mime' => 'image/jpeg',
+        'tg_channel' => $stream['thumb_channel'],
+        'tg_msg_id' => (int) ($stream['thumb_msg_id'] ?? 0),
+    ];
+}
+
+// Fill thumbnail disk caches for the first $max videos that don't have one yet.
+// Runs after the client already has its response, so nobody waits for Telegram.
+function warm_thumbs($metas, $max = 3) {
+    $done = 0;
+    $deadline = microtime(true) + 15;
+
+    foreach ((array) $metas as $meta) {
+        if ($done >= $max || microtime(true) > $deadline) {
+            break;
+        }
+        try {
+            $stream = store_to_stream_format($meta);
+        } catch (\Throwable $e) {
+            continue;
+        }
+        if (empty($stream['thumb_doc_id'])) {
+            continue;
+        }
+
+        $cacheKey = 'thumb_' . $stream['thumb_doc_id'] . '_' . $stream['thumb_size'];
+        if (fc_file($cacheKey, 2592000) !== null) {
+            continue;
+        }
+
+        try {
+            $bytes = $stream['thumb_size'] > 0
+                ? tg_read_file_range(thumbs_payload($stream), 0, $stream['thumb_size'] - 1)
+                : tg_read_file_range(thumbs_payload($stream), 0, 262143);
+            if (is_string($bytes) && $bytes !== '') {
+                fc_put($cacheKey, $bytes);
+                $done++;
+            }
+        } catch (\Throwable $e) {
+            // ignore: warming is best effort
+        }
+    }
+}
+
+function public_cache($seconds = 20) {
+    global $PUBLIC_CACHE_TTL;
+    $PUBLIC_CACHE_TTL = max(0, (int) $seconds);
+}
+
 function json_ok($data = []) {
+    global $PUBLIC_CACHE_TTL, $AFTER_RESPONSE;
     header('Content-Type: application/json');
-    echo json_encode(['ok' => true, 'data' => $data]);
+    $payload = json_encode(['ok' => true, 'data' => $data]);
+
+    if ($PUBLIC_CACHE_TTL > 0) {
+        $etag = '"' . md5($payload) . '"';
+        header('Cache-Control: public, max-age=' . $PUBLIC_CACHE_TTL . ', stale-while-revalidate=' . ($PUBLIC_CACHE_TTL * 2));
+        header('ETag: ' . $etag);
+        $ifNoneMatch = $_SERVER['HTTP_IF_NONE_MATCH'] ?? '';
+        if ($ifNoneMatch !== '' && trim($ifNoneMatch) === $etag) {
+            http_response_code(304);
+            exit;
+        }
+    } else {
+        // Data routes are never cached — not by the browser and not by a proxy.
+        header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
+        header('Pragma: no-cache');
+        header('Expires: 0');
+    }
+
+    // Compress JSON: the video list is a few KB and most visitors are on mobile
+    // data, where the transfer time is a real part of the wait.
+    if (strlen($payload) > 1024
+        && function_exists('gzencode')
+        && str_contains($_SERVER['HTTP_ACCEPT_ENCODING'] ?? '', 'gzip')) {
+        $gz = gzencode($payload, 5);
+        if (is_string($gz) && $gz !== '') {
+            header('Content-Encoding: gzip');
+            header('Vary: Origin, Accept-Encoding');
+            $payload = $gz;
+        }
+    }
+
+    echo $payload;
+
+    $needsBackground = $AFTER_RESPONSE !== null || store_has_stale();
+    if ($needsBackground) {
+        $job = $AFTER_RESPONSE;
+        flush_and_detach();
+        ignore_user_abort(true);
+        @set_time_limit(30);
+        try {
+            store_refresh_stale();   // stale-while-revalidate: refresh after the response
+        } catch (\Throwable $e) {
+            // background work must never leak an error to the client
+        }
+        if ($job !== null) {
+            try {
+                $job();
+            } catch (\Throwable $e) {
+                // background work must never leak an error to the client
+            }
+        }
+    }
     exit;
 }
 
@@ -62,12 +235,21 @@ function json_fail($error, $code = 400) {
 }
 
 function json_body() {
-    $raw = file_get_contents('php://input');
-    if (!is_string($raw) || trim($raw) === '') {
-        return [];
+    // Cached: the auth token may be read out of the body (see get_bearer_token)
+    // and route handlers read the same body again.
+    static $body = null;
+    if ($body !== null) {
+        return $body;
     }
-    $data = json_decode($raw, true);
-    return is_array($data) ? $data : [];
+    $raw = file_get_contents('php://input');
+    $body = [];
+    if (is_string($raw) && trim($raw) !== '') {
+        $data = json_decode($raw, true);
+        if (is_array($data)) {
+            $body = $data;
+        }
+    }
+    return $body;
 }
 
 // Remove internal bookkeeping keys before sending a record to a client
@@ -81,6 +263,10 @@ function strip_internal($record) {
 // === Firebase auth ===
 
 function get_bearer_token() {
+    // 1) Authorization header — works from server-to-server, Node/Vercel and
+    //    curl. A browser cannot use it here: the header is not CORS-safelisted,
+    //    so it triggers a preflight, and the preflight never carries the
+    //    hosting __test cookie.
     $auth = $_SERVER['HTTP_AUTHORIZATION']
         ?? $_SERVER['REDIRECT_HTTP_AUTHORIZATION']
         ?? '';
@@ -98,6 +284,24 @@ function get_bearer_token() {
     if (preg_match('/Bearer\s+(.*)$/i', $auth, $m)) {
         return trim($m[1]);
     }
+
+    // 2) JSON body — the browser sends it as "Content-Type: text/plain", which
+    //    is a safelisted content type, so the request stays a CORS "simple
+    //    request" and no preflight is made.
+    $body = json_body();
+    foreach (['idToken', 'token', 'authToken', 'id_token'] as $key) {
+        if (!empty($body[$key]) && is_string($body[$key])) {
+            return trim($body[$key]);
+        }
+    }
+
+    // 3) Query string — keeps plain GET requests preflight-free.
+    foreach (['token', 'id_token', 'access_token'] as $key) {
+        if (!empty($_GET[$key]) && is_string($_GET[$key])) {
+            return trim($_GET[$key]);
+        }
+    }
+
     return null;
 }
 
@@ -108,13 +312,22 @@ function verify_firebase_token($token) {
         return null;
     }
 
+    // A verified token never changes, and it stays valid for an hour: cache the
+    // Identity Toolkit answer so authenticated routes skip the round trip.
+    $cacheKey = 'fbtok_' . sha1($token);
+    $cached = fc_get($cacheKey, 900);
+    if (is_array($cached)) {
+        return $cached;
+    }
+
     $ch = curl_init('https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=' . FIREBASE_API_KEY);
     curl_setopt_array($ch, [
         CURLOPT_RETURNTRANSFER => true,
         CURLOPT_POST => true,
         CURLOPT_POSTFIELDS => json_encode(['idToken' => $token, 'maxResults' => 1]),
         CURLOPT_HTTPHEADER => ['Content-Type: application/json'],
-        CURLOPT_TIMEOUT => 15,
+        CURLOPT_TIMEOUT => 8,
+        CURLOPT_CONNECTTIMEOUT => 5,
     ]);
     $resp = curl_exec($ch);
     curl_close($ch);
@@ -131,6 +344,7 @@ function verify_firebase_token($token) {
         return null;
     }
 
+    fc_set($cacheKey, $data['users'][0]);
     return $data['users'][0];
 }
 
@@ -194,7 +408,19 @@ if ($path === '/api/debug' && $method === 'GET') {
         'amp_version' => class_exists('\Amp\Future') ? 'installed' : 'NOT installed',
         'mtproto' => mtproto_test_connection(),
         'store' => ['videos_count' => count(store_read_videos())],
+        'visitor' => visitor_status(),
     ]);
+}
+
+// Visitor log — the frontend calls this once per session, after the age gate.
+// The row is written after the response left the server, so the geo lookup and
+// the MySQL insert never delay the visitor (and never break the request).
+if ($path === '/api/visit' && ($method === 'POST' || $method === 'GET')) {
+    $payload = $method === 'POST' ? json_body() : $_GET;
+    after_response(function () use ($payload) {
+        visitor_log($payload);
+    });
+    json_ok(['logged' => true]);
 }
 
 // Video list — infinite scroll (?cursor= & ?limit=)
@@ -207,9 +433,15 @@ if ($path === '/api/videos' && $method === 'GET') {
     $limit = min($limit, 50);
 
     $metas = store_list_videos($cursor, $limit);
-    $videos = array_map('store_public_video', $metas);
+    $uid = premium_uid_optional();
+    $videos = array_map(function ($v) use ($uid) {
+        return premium_shape_video(store_public_video($v), $v, $uid);
+    }, $metas);
     $nextCursor = $videos ? (int) $metas[count($metas) - 1]['createdAt'] : null;
 
+    after_response(function () use ($metas) {
+        warm_thumbs($metas, 3);
+    });
     json_ok(['videos' => $videos, 'nextCursor' => $nextCursor]);
 }
 
@@ -227,7 +459,11 @@ if ($path === '/api/search' && $method === 'GET') {
     }
 
     $metas = array_slice(store_search_videos($q), 0, $limit);
-    json_ok(['videos' => array_map('store_public_video', $metas), 'nextCursor' => null]);
+    $uid = premium_uid_optional();
+    $videos = array_map(function ($v) use ($uid) {
+        return premium_shape_video(store_public_video($v), $v, $uid);
+    }, $metas);
+    json_ok(['videos' => $videos, 'nextCursor' => null]);
 }
 
 // Video detail — counts a view
@@ -239,12 +475,35 @@ if (preg_match('#^/api/videos/([^/]+)$#', $path, $m) && $method === 'GET') {
         json_fail('Video not found', 404);
     }
 
-    $video = store_increment_views($videoId);
-    if (!$video) {
-        json_fail('Video not found', 404);
-    }
+    // Count the view, but only after the response left the server: the Telegram
+    // message edit behind store_increment_views takes 1.5-2 s and the client
+    // has no reason to wait for it.
+    header('Content-Type: application/json');
+    header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
+    echo json_encode(['ok' => true, 'data' => premium_shape_video(store_public_video($video), $video, premium_uid_optional())]);
 
-    json_ok(store_public_video($video));
+    if (function_exists('fastcgi_finish_request')) {
+        fastcgi_finish_request();
+    } else {
+        while (ob_get_level() > 0) {
+            @ob_end_flush();
+        }
+        @flush();
+    }
+    ignore_user_abort(true);
+    @set_time_limit(25);
+
+    try {
+        store_refresh_stale();
+    } catch (\Throwable $e) {
+        // a failed refresh must never break the response
+    }
+    try {
+        store_increment_views($videoId);
+    } catch (\Throwable $e) {
+        // a missed view count must never break the response
+    }
+    exit;
 }
 
 // Thumbnail
@@ -269,6 +528,19 @@ if (preg_match('#^/api/videos/([^/]+)/thumbnail$#', $path, $m) && $method === 'G
         'tg_msg_id' => (int) ($stream['thumb_msg_id'] ?? 0),
     ];
 
+    // Thumbnails never change once uploaded: serve them from disk after the
+    // first Telegram read (that read is what made them take seconds).
+    $thumbCacheKey = 'thumb_' . $stream['thumb_doc_id'] . '_' . $stream['thumb_size'];
+    $thumbFile = fc_file($thumbCacheKey, 2592000);
+    if ($thumbFile !== null) {
+        header('Content-Type: image/jpeg');
+        header('Cache-Control: public, max-age=2592000, immutable');
+        header('Cross-Origin-Resource-Policy: cross-origin');
+        header('Content-Length: ' . filesize($thumbFile));
+        readfile($thumbFile);
+        exit;
+    }
+
     try {
         $bytes = $stream['thumb_size'] > 0
             ? tg_read_file_range($thumbMeta, 0, $stream['thumb_size'] - 1)
@@ -277,9 +549,14 @@ if (preg_match('#^/api/videos/([^/]+)/thumbnail$#', $path, $m) && $method === 'G
         json_fail('Thumbnail unavailable: ' . $e->getMessage(), 500);
     }
 
+    if (is_string($bytes) && $bytes !== '') {
+        fc_put($thumbCacheKey, $bytes);
+    }
+
     header('Content-Type: image/jpeg');
-    header('Cache-Control: public, max-age=86400');
+    header('Cache-Control: public, max-age=2592000, immutable');
     header('Cross-Origin-Resource-Policy: cross-origin');
+    header('Content-Length: ' . strlen($bytes));
     echo $bytes;
     exit;
 }
@@ -291,20 +568,41 @@ if (preg_match('#^/api/videos/([^/]+)/stream$#', $path, $m) && ($method === 'GET
         json_fail('Video not found', 404);
     }
 
-    // --- BestFile first: if the video has a BestFile link, redirect to its CDN ---
-    $bfLink = $video['bestfile']['download_link'] ?? '';
+    // Premium videos are never served from a bare URL: a signed token is
+    // required. The link never expires; for a full video the premium end time
+    // carried inside the token decides whether it may play.
+    $kind = (($_GET['kind'] ?? '') === 'trailer') ? 'trailer' : 'video';
+    if (premium_video_flag($video)) {
+        if ($kind === 'trailer' && !premium_has_trailer($video)) {
+            json_fail('No trailer for this video', 404);
+        }
+        $payload = premium_token_check($_GET['t'] ?? '', urldecode($m[1]), $kind);
+        if ($payload === null) {
+            json_fail('Invalid link — reload the page', 403);
+        }
+        if ($kind === 'video' && (int) ($payload['p'] ?? 0) <= time()) {
+            json_fail('Premium required', 403);
+        }
+    }
+
+    // --- BestFile first: if the file has a BestFile link, redirect to its CDN ---
+    $bfLink = $kind === 'trailer'
+        ? (string) ($video['trailer']['bestfile']['download_link'] ?? '')
+        : (string) ($video['bestfile']['download_link'] ?? '');
     if ($bfLink) {
         $cdnUrl = bestfile_get_cdn_url($bfLink);
         if ($cdnUrl) {
             http_response_code(302);
             header('Location: ' . $cdnUrl);
-            header('Cache-Control: public, max-age=300');
+            // The signed URL is per-request; a cached redirect would hand out
+            // an expired link, so the browser must never store it.
+            header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
             exit;
         }
         // If CDN URL fetch fails, fall through to Telegram MTProto streaming below
     }
 
-    $stream = store_to_stream_format($video);
+    $stream = store_to_stream_format($video, $kind);
     $fileSize = (int) $stream['tg_size'];
 
     if ($fileSize <= 0) {
@@ -337,27 +635,80 @@ if (preg_match('#^/api/videos/([^/]+)/stream$#', $path, $m) && ($method === 'GET
 
     // Fast-start: if moov is at the end of the file, send ftyp + moov first
     if ($start === 0) {
-        try {
-            $moov = tg_find_moov_atom($stream);
-            if ($moov) {
-                $ftypData = tg_read_file_range($stream, 0, 31);
-                $totalBytes = strlen($ftypData) + strlen($moov['data']);
+        // The ftyp+moov prefix is what the player needs first, and finding it
+        // costs several megabytes of Telegram reads — cache the result.
+        $moovCacheKey = 'moov_' . $stream['tg_doc_id'] . '_' . $fileSize;
+        $moovChunk = fc_get($moovCacheKey, 2592000);
 
-                http_response_code(206);
-                header('Content-Type: video/mp4');
-                header('Accept-Ranges: bytes');
-                header('Content-Length: ' . $totalBytes);
-                header('Content-Range: bytes 0-' . ($totalBytes - 1) . '/' . $fileSize);
-                header('Cache-Control: public, max-age=3600');
-                header('Vary: Origin, Range');
-                header('Cross-Origin-Resource-Policy: cross-origin');
-
-                echo $ftypData;
-                echo $moov['data'];
-                exit;
+        if (!is_string($moovChunk) || $moovChunk === '') {
+            $moovChunk = null;
+            try {
+                $moov = tg_find_moov_atom($stream);
+                if ($moov) {
+                    $ftypData = tg_read_file_range($stream, 0, 31);
+                    $moovChunk = $ftypData . $moov['data'];
+                    fc_set($moovCacheKey, $moovChunk);
+                }
+            } catch (\Throwable $e) {
+                // moov probe failed — fall through to normal streaming
             }
-        } catch (\Throwable $e) {
-            // moov probe failed — fall through to normal streaming
+        }
+
+        if (is_string($moovChunk) && $moovChunk !== '') {
+            $totalBytes = strlen($moovChunk);
+
+            http_response_code(206);
+            header('Content-Type: video/mp4');
+            header('Accept-Ranges: bytes');
+            header('Content-Length: ' . $totalBytes);
+            header('Content-Range: bytes 0-' . ($totalBytes - 1) . '/' . $fileSize);
+            header('Cache-Control: public, max-age=3600');
+            header('Vary: Origin, Range');
+            header('Cross-Origin-Resource-Policy: cross-origin');
+
+            echo $moovChunk;
+            exit;
+        }
+    }
+
+    // Playback always starts near byte 0 and the first Telegram read is what
+    // makes it slow, so the first 2 MB of every video is kept on disk.
+    if ($start < 2097152 && $fileSize > 0) {
+        $prefixKey = 'vpre_' . $stream['tg_doc_id'] . '_' . $fileSize;
+        $need = min(2097152, $end + 1);
+        $prefix = fc_get($prefixKey, 2592000);
+
+        if (!is_string($prefix) || strlen($prefix) < $need) {
+            try {
+                $prefix = tg_read_file_range($stream, 0, (min(2097152, $fileSize) - 1));
+                if (is_string($prefix) && $prefix !== '') {
+                    fc_set($prefixKey, $prefix);
+                } else {
+                    $prefix = null;
+                }
+            } catch (\Throwable $e) {
+                $prefix = null;
+            }
+        }
+
+        if (is_string($prefix) && $need > 0 && strlen($prefix) >= $need) {
+            $chunk = substr($prefix, $start, $end - $start + 1);
+
+            http_response_code($status);
+            header('Content-Type: ' . ($stream['tg_mime'] ?: 'video/mp4'));
+            header('Accept-Ranges: bytes');
+            header('Content-Length: ' . strlen($chunk));
+            header('Content-Disposition: inline');
+            header('Cache-Control: public, max-age=3600');
+            header('Vary: Origin, Range');
+            header('Cross-Origin-Resource-Policy: cross-origin');
+            if ($status === 206) {
+                header('Content-Range: bytes ' . $start . '-' . ($start + strlen($chunk) - 1) . '/' . $fileSize);
+            }
+            if ($method !== 'HEAD') {
+                echo $chunk;
+            }
+            exit;
         }
     }
 
@@ -463,8 +814,9 @@ if ($path === '/api/auth/profile' && $method === 'POST') {
     ]);
 }
 
-// Current user
-if ($path === '/api/auth/me' && $method === 'GET') {
+// Current user — POST is accepted as well: a browser GET cannot carry a body,
+// and every write-free auth call has to stay a CORS "simple request".
+if ($path === '/api/auth/me' && ($method === 'GET' || $method === 'POST')) {
     $auth = require_auth();
 
     $user = store_find_user_by_uid($auth['uid']);
@@ -511,7 +863,7 @@ function json_videos_for_ids($ids) {
 }
 
 // Liked videos
-if ($path === '/api/user/liked' && $method === 'GET') {
+if ($path === '/api/user/liked' && ($method === 'GET' || $method === 'POST')) {
     $auth = require_auth();
 
     $ids = store_get_liked_videos($auth['uid']);
@@ -523,7 +875,7 @@ if ($path === '/api/user/liked' && $method === 'GET') {
 }
 
 // Saved videos
-if ($path === '/api/user/saved' && $method === 'GET') {
+if ($path === '/api/user/saved' && ($method === 'GET' || $method === 'POST')) {
     $auth = require_auth();
 
     $ids = store_get_saved_videos($auth['uid']);
@@ -535,7 +887,7 @@ if ($path === '/api/user/saved' && $method === 'GET') {
 }
 
 // Referral tree (direct + level 2)
-if ($path === '/api/user/referrals' && $method === 'GET') {
+if ($path === '/api/user/referrals' && ($method === 'GET' || $method === 'POST')) {
     $auth = require_auth();
 
     $tree = store_get_referral_tree($auth['uid']);
@@ -551,6 +903,60 @@ if ($path === '/api/user/referrals' && $method === 'GET') {
 // ============================
 
 // Store metadata that the browser-side admin panel uploaded to Telegram itself
+// ============================
+// PREMIUM ROUTES (referral based)
+// ============================
+
+if ($path === '/api/premium/status' && ($method === 'GET' || $method === 'POST')) {
+    $auth = require_auth();
+    json_ok(premium_status($auth['uid']));
+}
+
+if ($path === '/api/premium/history' && ($method === 'GET' || $method === 'POST')) {
+    $auth = require_auth();
+    $history = premium_history($auth['uid']);
+    $history['status'] = premium_status($auth['uid']);
+    json_ok($history);
+}
+
+// Spend referrals: {count: 1} → 2.5h, 2 → 5h, 4 → 10h
+if ($path === '/api/premium/redeem' && $method === 'POST') {
+    $auth = require_auth();
+    $body = json_body();
+    $result = premium_redeem_referrals($auth['uid'], (int) ($body['count'] ?? 1));
+    if (empty($result['ok'])) {
+        json_fail($result['error'] ?? 'Could not activate premium', $result['code'] ?? 400);
+    }
+    json_ok(['status' => $result['status'], 'entry' => $result['entry']]);
+}
+
+// Admin: grant premium by hand (payment settled offline, or a correction)
+if ($path === '/api/admin/premium/grant' && $method === 'POST') {
+    require_admin();
+    $body = json_body();
+    $result = premium_grant(
+        (string) ($body['uid'] ?? ''),
+        (float) ($body['hours'] ?? 0),
+        (string) ($body['source'] ?? 'admin'),
+        (int) ($body['amountPaise'] ?? 0),
+        (string) ($body['note'] ?? '')
+    );
+    if (empty($result['ok'])) {
+        json_fail($result['error'] ?? 'Could not grant premium');
+    }
+    json_ok($result);
+}
+
+// Admin: one user's premium state + full history
+if ($path === '/api/admin/premium' && $method === 'GET') {
+    require_admin();
+    $uid = (string) ($_GET['uid'] ?? '');
+    if ($uid === '') {
+        json_fail('uid required');
+    }
+    json_ok(['status' => premium_status($uid), 'history' => premium_history($uid)]);
+}
+
 if ($path === '/api/admin/metadata' && $method === 'POST') {
     require_admin();
 
@@ -575,6 +981,7 @@ if ($path === '/api/admin/metadata' && $method === 'POST') {
         'likedBy' => $body['likedBy'] ?? [],
         'duration' => (int) ($body['duration'] ?? 0),
         'createdAt' => (int) ($body['createdAt'] ?? time()),
+        'trailer' => store_build_trailer($body['trailer'] ?? null),
         'video' => [
             'docId' => (string) store_field($video, 'docId', 'tg_doc_id', ''),
             'accessHash' => (string) store_field($video, 'accessHash', 'tg_access_hash', ''),
@@ -643,6 +1050,29 @@ if ($path === '/api/admin/upload' && $method === 'POST') {
     $exclusive = (($_POST['exclusive'] ?? '') === 'true');
     $premium = (($_POST['premium'] ?? '') === 'true');
 
+    // Trailer: uploaded to the same Telegram video channel, stored inside the
+    // same metadata message as the video (PHP has no BestFile uploader, so the
+    // BestFile trailer copy is only made from the local admin panel).
+    $trailer = null;
+    if (!empty($_FILES['trailer']) && ($_FILES['trailer']['error'] ?? 1) === 0) {
+        try {
+            $tmsg = tg_upload_video(TG_CHANNEL_VIDEO, $_FILES['trailer']['tmp_name'], $title . ' (trailer)', $_FILES['trailer']['name']);
+            $tdoc = $tmsg['media']['document'] ?? ($tmsg['document'] ?? null);
+            $trailer = [
+                'docId' => (string) ($tdoc['id'] ?? ''),
+                'accessHash' => (string) ($tdoc['access_hash'] ?? ''),
+                'fileRef' => base64_encode($tdoc['file_reference'] ?? ''),
+                'size' => (int) ($tdoc['size'] ?? 0),
+                'mime' => $tdoc['mime_type'] ?? 'video/mp4',
+                'msgId' => (int) ($tmsg['id'] ?? 0),
+                'filename' => $_FILES['trailer']['name'],
+            ];
+        } catch (\Throwable $e) {
+            json_fail('Trailer upload failed: ' . $e->getMessage(), 500);
+        }
+        @unlink($_FILES['trailer']['tmp_name']);
+    }
+
     try {
         $msg = tg_upload_video(TG_CHANNEL_VIDEO, $file['tmp_name'], $title, $file['name']);
         $doc = $msg['media']['document'] ?? ($msg['document'] ?? null);
@@ -665,6 +1095,7 @@ if ($path === '/api/admin/upload' && $method === 'POST') {
                 'filename' => $file['name'],
             ],
             'thumbnail' => null,
+            'trailer' => $trailer,
         ]);
     } catch (\Throwable $e) {
         json_fail('Upload to Telegram failed: ' . $e->getMessage(), 500);

@@ -9,13 +9,16 @@
 //
 // 1 unused referral = 2.5h. A referred user is spent only once (refsUsed is the
 // idempotency key). Premium extends from max(now, current end).
+//
+// Stream links never time out: the same user+video+kind always gets the same
+// signed link. A full-video link still stops when the premium end time carried
+// inside it passes, so access follows the account and not the clock.
 
 const crypto = require("crypto");
 const tg = require("./telegram");
 const users = require("./users");
 
 const SECONDS_PER_REF = 9000; // 2h 30m
-const TOKEN_TTL = 600;
 const LEDGER_TTL = 60 * 1000;
 const SECRET = process.env.PREMIUM_SECRET || "im_prem_7c1f9a24db6e8053";
 
@@ -199,11 +202,13 @@ async function grant(uid, hours, source = "admin", amountPaise = 0, note = "") {
   return { ok: true, entry, status: await status(uid) };
 }
 
-// ---- signed stream tokens (same format as PHP) ----
+// ---- signed stream links (same format as PHP) ----
+// No issue/expiry stamp: the link is permanent, the premium end time inside it
+// is what the stream route enforces for a full video.
 function token(uid, videoId, kind = "video", premiumUntilValue = 0) {
   const payload = {
     u: String(uid || ""), v: String(videoId), k: kind === "trailer" ? "trailer" : "video",
-    e: Math.floor(Date.now() / 1000) + TOKEN_TTL, p: Number(premiumUntilValue) || 0,
+    p: Number(premiumUntilValue) || 0,
   };
   const body = Buffer.from(JSON.stringify(payload)).toString("base64url");
   const sig = crypto.createHmac("sha256", SECRET).update(body).digest("hex");
@@ -222,7 +227,6 @@ function checkToken(value, videoId, kind) {
   if (!payload) return null;
   if (String(payload.v) !== String(videoId)) return null;
   if (String(payload.k) !== (kind === "trailer" ? "trailer" : "video")) return null;
-  if (Number(payload.e) < Math.floor(Date.now() / 1000)) return null;
   return payload;
 }
 
