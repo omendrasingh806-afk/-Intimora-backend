@@ -97,8 +97,14 @@ function fc_set($key, $value) {
     fc_write($key, serialize($value));
 }
 
+// Existence is checked first: this hosting turns even an @-suppressed unlink()
+// warning on a missing file into an exception, which used to abort a write right
+// after it had already reached Telegram.
 function fc_forget($key) {
-    @unlink(fc_path($key));
+    $file = fc_path($key);
+    if (is_file($file)) {
+        @unlink($file);
+    }
 }
 
 // Path of a fresh binary cache file (thumbnails, mp4 header chunk), or null.
