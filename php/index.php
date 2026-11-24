@@ -775,7 +775,7 @@ if ($path === '/api/auth/verify' && $method === 'POST') {
         json_ok(['exists' => false, 'email' => $auth['email'], 'uid' => $auth['uid']]);
     }
 
-    json_ok(['exists' => true, 'user' => strip_internal($user)]);
+            json_ok(['exists' => true, 'user' => strip_internal(store_user_with_collections($user))]);
 }
 
 // Complete profile — new user only
@@ -838,7 +838,7 @@ if ($path === '/api/auth/me' && ($method === 'GET' || $method === 'POST')) {
         json_fail('User not found', 404);
     }
 
-    json_ok(['user' => strip_internal($user)]);
+    json_ok(['user' => strip_internal(store_user_with_collections($user))]);
 }
 
 // Like / unlike (updates the user's likedVideos, like the Node backend)

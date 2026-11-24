@@ -470,7 +470,9 @@ app.get("/api/auth/me", auth, async (req, res) => {
   try {
     const user = await users.findByUid(req.userId);
     if (!user) return fail(res, "User not found", 404);
-    ok(res, { user });
+    // The ids live in the like/save collection channel; the account response
+    // still carries them, so a client never needs to know that.
+    ok(res, { user: await users.withCollections(user) });
   } catch (e) { fail(res, e.message, 500); }
 });
 

@@ -44,6 +44,11 @@ function channelReferrals() {
 function channelPremium() {
   return process.env.TELEGRAM_CHANNEL_PREMIUM || process.env.PREMIUM_CHANNEL || "-1004327041194";
 }
+// Like/save collections — one JSON message per user, keyed by the user's uid.
+// Same channel and default as the PHP backend's TG_CHANNEL_ACCOUNTS.
+function channelAccounts() {
+  return process.env.TELEGRAM_CHANNEL_ACCOUNTS || "-1004393682063";
+}
 
 let _clientLock = Promise.resolve();
 async function getClient() {
@@ -705,6 +710,7 @@ async function readMessages(channel, limit = 5000) {
 
 module.exports = {
   channelPremium,
+  channelAccounts,
   getClient,
   sendLoginCode,
   verifyLogin,

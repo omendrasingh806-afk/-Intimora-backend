@@ -19,6 +19,9 @@ define('TG_CHANNEL_META', '-1003777974779');
 define('TG_CHANNEL_USERS', '-1004368963146');
 define('TG_CHANNEL_REFERRALS', '-1004451213988');
 define('TG_CHANNEL_PREMIUM', '-1004327041194');
+// Like/save collections — one JSON message per user, keyed by the user's uid.
+// Must match the Vercel backend's TELEGRAM_CHANNEL_ACCOUNTS default.
+define('TG_CHANNEL_ACCOUNTS', '-1004393682063');
 
 // === Premium ===
 // Append-only ledger lives in TG_CHANNEL_PREMIUM. PREMIUM_SECRET signs the

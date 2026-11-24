@@ -145,41 +145,110 @@ async function updateUser(uid, updates) {
   return user;
 }
 
-// ---- Toggle like on video ----
-async function toggleLike(uid, videoId) {
+// ---- Like/save collections ----
+// One JSON message per user in their own channel, keyed by the user's uid:
+//   { t: "likes", uid, likedVideos: [...], savedVideos: [...], updatedAt }
+// Keeping the id lists out of the user record means a growing list can never hit
+// Telegram's message-size limit, and a like never rewrites the account. Records
+// written before this channel existed are seeded from the user record on the
+// first read and written here on the first change, so nothing is lost.
+let collectionsCache = null;
+let collectionsCacheTime = 0;
+
+async function readCollections() {
+  if (collectionsCache && (Date.now() - collectionsCacheTime) < CACHE_TTL) {
+    return collectionsCache;
+  }
+  const messages = await tg.readMessages(tg.channelAccounts(), 5000);
+  const records = new Map();
+  for (const m of messages) {
+    let data;
+    try { data = JSON.parse(m.text); } catch { continue; }
+    if (!data || data.t !== "likes" || typeof data.uid !== "string") continue;
+    data.likedVideos = Array.isArray(data.likedVideos) ? data.likedVideos : [];
+    data.savedVideos = Array.isArray(data.savedVideos) ? data.savedVideos : [];
+    // A uid should have exactly one record; if an older one is still in the
+    // channel, the newest (read first) wins.
+    if (records.has(data.uid)) continue;
+    data._msgId = m.id;
+    records.set(data.uid, data);
+  }
+  collectionsCache = records;
+  collectionsCacheTime = Date.now();
+  return records;
+}
+
+function invalidateCollections() {
+  collectionsCache = null;
+  collectionsCacheTime = 0;
+}
+
+async function readCollection(uid) {
+  const collections = await readCollections();
+  const existing = collections.get(uid);
+  if (existing) return existing;
   const user = await findByUid(uid);
   if (!user) return null;
-  const liked = user.likedVideos || [];
+  return {
+    t: "likes",
+    uid,
+    likedVideos: [...(user.likedVideos || [])],
+    savedVideos: [...(user.savedVideos || [])],
+    _msgId: null,
+  };
+}
+
+async function writeCollection(record) {
+  const data = {
+    t: "likes",
+    uid: record.uid,
+    likedVideos: [...(record.likedVideos || [])],
+    savedVideos: [...(record.savedVideos || [])],
+    updatedAt: Math.floor(Date.now() / 1000),
+  };
+  const text = JSON.stringify(data);
+  if (record._msgId) await tg.editMessage(tg.channelAccounts(), record._msgId, text);
+  else data._msgId = await tg.sendMessage(tg.channelAccounts(), text);
+  invalidateCollections();
+  return data;
+}
+
+// The user JSON a client reads carries the ids from the collection channel, so
+// the app never has to know where they are stored.
+async function withCollections(user) {
+  if (!user) return user;
+  const collection = await readCollection(user.uid);
+  if (!collection) return user;
+  return { ...user, likedVideos: collection.likedVideos, savedVideos: collection.savedVideos };
+}
+
+// ---- Toggle like on video ----
+async function toggleLike(uid, videoId) {
+  const collection = await readCollection(uid);
+  if (!collection) return null;
+  const liked = collection.likedVideos;
   const idx = liked.indexOf(videoId);
   if (idx >= 0) {
     liked.splice(idx, 1);
   } else {
     liked.push(videoId);
   }
-  user.likedVideos = liked;
-  await tg.editMessage(tg.channelUsers(), user._msgId, JSON.stringify(user));
-
-  // Update cache timestamp — user object is from cache, already modified
-  usersCacheTime = Date.now();
+  await writeCollection({ ...collection, likedVideos: liked });
   return { liked: idx === -1, likedVideos: liked };
 }
 
 // ---- Toggle save on video ----
 async function toggleSave(uid, videoId) {
-  const user = await findByUid(uid);
-  if (!user) return null;
-  const saved = user.savedVideos || [];
+  const collection = await readCollection(uid);
+  if (!collection) return null;
+  const saved = collection.savedVideos;
   const idx = saved.indexOf(videoId);
   if (idx >= 0) {
     saved.splice(idx, 1);
   } else {
     saved.push(videoId);
   }
-  user.savedVideos = saved;
-  await tg.editMessage(tg.channelUsers(), user._msgId, JSON.stringify(user));
-
-  // Update cache timestamp — user object is from cache, already modified
-  usersCacheTime = Date.now();
+  await writeCollection({ ...collection, savedVideos: saved });
   return { saved: idx === -1, savedVideos: saved };
 }
 
@@ -225,16 +294,14 @@ async function getReferralTree(uid) {
 
 // ---- Get user's liked videos ----
 async function getLikedVideos(uid) {
-  const user = await findByUid(uid);
-  if (!user) return null;
-  return user.likedVideos || [];
+  const collection = await readCollection(uid);
+  return collection ? collection.likedVideos : null;
 }
 
 // ---- Get user's saved videos ----
 async function getSavedVideos(uid) {
-  const user = await findByUid(uid);
-  if (!user) return null;
-  return user.savedVideos || [];
+  const collection = await readCollection(uid);
+  return collection ? collection.savedVideos : null;
 }
 
 module.exports = {
@@ -247,6 +314,7 @@ module.exports = {
   findByReferralCode,
   createUser,
   updateUser,
+  withCollections,
   toggleLike,
   toggleSave,
   getReferralTree,

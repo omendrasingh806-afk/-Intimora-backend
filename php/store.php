@@ -46,6 +46,7 @@ $_storeCache = [
     'videos' => ['data' => null, 'time' => 0],
     'users' => ['data' => null, 'time' => 0],
     'referrals' => ['data' => null, 'time' => 0],
+    'collections' => ['data' => null, 'time' => 0],
 ];
 
 // Types that were served stale in this request and need a background refresh.
@@ -977,13 +978,115 @@ function store_update_user($uid, $updates) {
     return $data;
 }
 
-function store_toggle_user_like($uid, $videoId) {
+// === Like/save collections ===
+//
+// Likes and saves live in their own channel (TG_CHANNEL_ACCOUNTS), one JSON
+// message per user keyed by the user's uid:
+//   {"t":"likes","uid":"…","likedVideos":[…],"savedVideos":[…],"updatedAt":…}
+// Keeping the id lists out of the user record means a growing list can never hit
+// Telegram's message-size limit, and the lists never rewrite an account. Records
+// written before this channel existed are seeded from the user record on the
+// first read and written here on the first change, so nothing is lost.
+
+function store_read_collections($force = false) {
+    if (!$force) {
+        $cached = store_get_cache('collections');
+        if ($cached !== null) {
+            return $cached;
+        }
+    }
+
+    $records = [];
+    foreach (store_read_messages(TG_CHANNEL_ACCOUNTS) as $msg) {
+        $text = $msg['message'] ?? '';
+        if (!is_string($text) || $text === '') {
+            continue;
+        }
+        $data = json_decode($text, true);
+        if (!is_array($data) || ($data['t'] ?? '') !== 'likes' || !is_string($data['uid'] ?? null)) {
+            continue;
+        }
+        $data['likedVideos'] = array_values((array) ($data['likedVideos'] ?? []));
+        $data['savedVideos'] = array_values((array) ($data['savedVideos'] ?? []));
+        // A uid should have exactly one record; if an older one is still in the
+        // channel, the newest (read first) wins.
+        if (isset($records[$data['uid']])) {
+            continue;
+        }
+        $data['_msgId'] = (int) ($msg['id'] ?? 0);
+        $records[$data['uid']] = $data;
+    }
+
+    store_cache('collections', $records);
+    return $records;
+}
+
+function store_collection($uid) {
+    $uid = (string) $uid;
+    if ($uid === '') {
+        return null;
+    }
+    $all = store_read_collections();
+    if (isset($all[$uid])) {
+        return $all[$uid];
+    }
+
     $user = store_find_user_by_uid($uid);
     if (!$user) {
         return null;
     }
+    return [
+        't' => 'likes',
+        'uid' => $uid,
+        'likedVideos' => array_values((array) ($user['likedVideos'] ?? [])),
+        'savedVideos' => array_values((array) ($user['savedVideos'] ?? [])),
+        '_msgId' => 0,
+    ];
+}
 
-    $liked = $user['likedVideos'] ?? [];
+function store_write_collection($record) {
+    $data = [
+        't' => 'likes',
+        'uid' => (string) $record['uid'],
+        'likedVideos' => array_values((array) ($record['likedVideos'] ?? [])),
+        'savedVideos' => array_values((array) ($record['savedVideos'] ?? [])),
+        'updatedAt' => time(),
+    ];
+    $json = json_encode($data, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+
+    if (!empty($record['_msgId'])) {
+        tg_edit_message(TG_CHANNEL_ACCOUNTS, (int) $record['_msgId'], $json);
+    } else {
+        $result = tg_send_message(TG_CHANNEL_ACCOUNTS, $json);
+        $data['_msgId'] = tg_msg_id($result);
+    }
+
+    store_clear_cache('collections');
+    return $data;
+}
+
+// The user JSON a client reads carries the ids from the collection channel, so
+// the app never has to know where they are stored.
+function store_user_with_collections($user) {
+    if (!is_array($user) || (string) ($user['uid'] ?? '') === '') {
+        return $user;
+    }
+    $collection = store_collection($user['uid']);
+    if ($collection === null) {
+        return $user;
+    }
+    $user['likedVideos'] = $collection['likedVideos'];
+    $user['savedVideos'] = $collection['savedVideos'];
+    return $user;
+}
+
+function store_toggle_user_like($uid, $videoId) {
+    $collection = store_collection($uid);
+    if ($collection === null) {
+        return null;
+    }
+
+    $liked = $collection['likedVideos'];
     $idx = array_search($videoId, $liked, true);
     if ($idx !== false) {
         array_splice($liked, $idx, 1);
@@ -991,17 +1094,18 @@ function store_toggle_user_like($uid, $videoId) {
         $liked[] = $videoId;
     }
 
-    store_update_user($uid, ['likedVideos' => array_values($liked)]);
+    $collection['likedVideos'] = array_values($liked);
+    store_write_collection($collection);
     return ['liked' => $idx === false, 'likedVideos' => array_values($liked)];
 }
 
 function store_toggle_user_save($uid, $videoId) {
-    $user = store_find_user_by_uid($uid);
-    if (!$user) {
+    $collection = store_collection($uid);
+    if ($collection === null) {
         return null;
     }
 
-    $saved = $user['savedVideos'] ?? [];
+    $saved = $collection['savedVideos'];
     $idx = array_search($videoId, $saved, true);
     if ($idx !== false) {
         array_splice($saved, $idx, 1);
@@ -1009,24 +1113,19 @@ function store_toggle_user_save($uid, $videoId) {
         $saved[] = $videoId;
     }
 
-    store_update_user($uid, ['savedVideos' => array_values($saved)]);
+    $collection['savedVideos'] = array_values($saved);
+    store_write_collection($collection);
     return ['saved' => $idx === false, 'savedVideos' => array_values($saved)];
 }
 
 function store_get_liked_videos($uid) {
-    $user = store_find_user_by_uid($uid);
-    if (!$user) {
-        return null;
-    }
-    return $user['likedVideos'] ?? [];
+    $collection = store_collection($uid);
+    return $collection === null ? null : $collection['likedVideos'];
 }
 
 function store_get_saved_videos($uid) {
-    $user = store_find_user_by_uid($uid);
-    if (!$user) {
-        return null;
-    }
-    return $user['savedVideos'] ?? [];
+    $collection = store_collection($uid);
+    return $collection === null ? null : $collection['savedVideos'];
 }
 
 // === Referrals ===
