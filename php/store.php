@@ -60,17 +60,25 @@ if (!defined('STORE_REFRESH_MAX_PAGES')) {
     define('STORE_REFRESH_MAX_PAGES', 5);
 }
 
-function store_cache($type, $data) {
+// $touch is false for cache patches (a new like/view/etc.): the data is stored
+// but the freshness clock is left alone, so a busy site cannot keep pushing the
+// background refresh forward and starve new videos out of the list forever.
+function store_cache($type, $data, $touch = true) {
     global $_storeCache, $_storeVideoIndex, $_storeStale;
     if ($type === 'videos') {
         $_storeVideoIndex = null;
     }
-    unset($_storeStale[$type]);
     if (!isset($_storeCache[$type])) {
         $_storeCache[$type] = ['data' => null, 'time' => 0];
     }
     $_storeCache[$type]['data'] = $data;
-    $_storeCache[$type]['time'] = time();
+    if ($touch) {
+        $_storeCache[$type]['time'] = time();
+        unset($_storeStale[$type]);
+        // The read time is stored separately from the data: patching the data
+        // rewrites the file, and its mtime must not count as a channel read.
+        fc_set('store_ts_' . $type, time());
+    }
 
     // Persist across requests: the disk copy is what lets the next request
     // answer without a single Telegram round trip.
@@ -91,10 +99,15 @@ function store_get_cache($type) {
         return null;
     }
 
-    $age = fc_age('store_' . $type);
+    $age = fc_get('store_ts_' . $type, 31536000);
+    if (!is_int($age)) {
+        // Cache written before the separate read stamp existed.
+        $age = fc_age('store_' . $type);
+    }
     if ($age === null || $age >= STORE_DISK_STALE) {
         return null;
     }
+    $age = max(0, time() - $age);
 
     // Fresh or stale: read the cached copy once, no Telegram round trip.
     $fromDisk = fc_peek('store_' . $type);
@@ -124,6 +137,10 @@ function store_cache_age($type) {
     global $_storeCache;
     if (isset($_storeCache[$type]['data']) && $_storeCache[$type]['data'] !== null) {
         return max(0, time() - (int) $_storeCache[$type]['time']);
+    }
+    $stamp = fc_get('store_ts_' . $type, 31536000);
+    if (is_int($stamp)) {
+        return max(0, time() - $stamp);
     }
     return fc_age('store_' . $type);
 }
@@ -159,12 +176,14 @@ function store_clear_cache($type = null) {
             $_storeCache[$type]['time'] = 0;
         }
         fc_forget('store_' . $type);
+        fc_forget('store_ts_' . $type);
     } else {
         $_storeStale = [];
         foreach (array_keys($_storeCache) as $key) {
             $_storeCache[$key]['data'] = null;
             $_storeCache[$key]['time'] = 0;
             fc_forget('store_' . $key);
+            fc_forget('store_ts_' . $key);
         }
     }
 }
@@ -723,7 +742,7 @@ function store_cache_store_video($record) {
         $list[] = $record;
         store_videos_sort($list);
     }
-    store_cache('videos', $list);
+    store_cache('videos', $list, false);
 }
 
 // Patch a single entry in the (possibly warm) cache after a write
@@ -740,7 +759,7 @@ function store_cache_remove_video($videoId) {
     $list = array_values(array_filter($_storeCache['videos']['data'], function ($v) use ($videoId) {
         return (string) ($v['id'] ?? '') !== (string) $videoId;
     }));
-    store_cache('videos', $list);
+    store_cache('videos', $list, false);
 }
 
 // Insert or replace one user record in the warm users cache.
@@ -766,7 +785,7 @@ function store_cache_store_user($record) {
     if (!$found) {
         $list[] = $record;
     }
-    store_cache('users', $list);
+    store_cache('users', $list, false);
 }
 
 // Insert or replace one user's like/save collection in the warm cache.
@@ -780,7 +799,7 @@ function store_cache_store_collection($record) {
         return;
     }
     $_storeCache['collections']['data'][$uid] = $record;
-    store_cache('collections', $_storeCache['collections']['data']);
+    store_cache('collections', $_storeCache['collections']['data'], false);
 }
 
 // Merge $updates into a video's metadata message (edit in place)
@@ -806,7 +825,7 @@ function store_update_video_stats($videoId, $updates) {
             $list[$i] = $data;
         }
     }
-    store_cache('videos', $list);
+    store_cache('videos', $list, false);
 
     return $data;
 }
