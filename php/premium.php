@@ -391,8 +391,9 @@ function premium_token_check($token, $videoId, $kind) {
     if ((string) ($payload['k'] ?? '') !== ($kind === 'trailer' ? 'trailer' : 'video')) {
         return null;
     }
-    // No expiry check: the link is permanent, the premium end time inside it
-    // is what the stream route enforces for a full video.
+    // No expiry check: the link is permanent. For a full video the stream route
+    // asks the ledger whether this uid's premium is running right now; the `p`
+    // field is only informational and never grants access by itself.
     return $payload;
 }
 
