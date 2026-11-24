@@ -426,6 +426,54 @@ if ($path === '/api/visit' && ($method === 'POST' || $method === 'GET')) {
     json_ok(['logged' => true]);
 }
 
+// Every public answer carries a BestFile *direct* link, resolved from the page
+// link on this request. The signed file URL expires, so it is never reused from
+// an earlier answer: each request asks BestFile for a new one. A failure keeps
+// the page link rather than dropping the file.
+function public_with_direct_links(array $pub, $resolved = null) {
+    $direct = function ($link) use ($resolved) {
+        $link = (string) $link;
+        if ($link === '') return '';
+        if ($resolved === null) {
+            $url = bestfile_get_cdn_url($link);
+            return is_string($url) ? $url : '';
+        }
+        return (string) ($resolved[$link] ?? '');
+    };
+
+    $link = (string) ($pub['bestfile']['download_link'] ?? '');
+    $url = $direct($link);
+    if ($url !== '') {
+        $pub['bestfile']['page_url'] = $link;
+        $pub['bestfile']['download_link'] = $url;
+        $pub['cdnUrl'] = $url;
+    }
+
+    $trailer = (string) ($pub['trailerBestfile'] ?? '');
+    $trailerUrl = $direct($trailer);
+    if ($trailerUrl !== '') {
+        $pub['trailerPageUrl'] = $trailer;
+        $pub['trailerBestfile'] = $trailerUrl;
+    }
+
+    return $pub;
+}
+
+// Resolve every BestFile page link of a list in one batch.
+function public_list_with_direct_links(array $videos) {
+    $links = [];
+    foreach ($videos as $v) {
+        $link = (string) ($v['bestfile']['download_link'] ?? '');
+        if ($link !== '') $links[] = $link;
+        $trailer = (string) ($v['trailerBestfile'] ?? '');
+        if ($trailer !== '') $links[] = $trailer;
+    }
+    $resolved = $links ? bestfile_get_cdn_urls($links) : [];
+    return array_map(function ($v) use ($resolved) {
+        return public_with_direct_links($v, $resolved);
+    }, $videos);
+}
+
 // Video list — infinite scroll (?cursor= & ?limit=)
 if ($path === '/api/videos' && $method === 'GET') {
     $cursor = (int) ($_GET['cursor'] ?? 0);
@@ -437,9 +485,9 @@ if ($path === '/api/videos' && $method === 'GET') {
 
     $metas = store_list_videos($cursor, $limit);
     $uid = premium_uid_optional();
-    $videos = array_map(function ($v) use ($uid) {
+    $videos = public_list_with_direct_links(array_map(function ($v) use ($uid) {
         return premium_shape_video(store_public_video($v), $v, $uid);
-    }, $metas);
+    }, $metas));
     $nextCursor = $videos ? (int) $metas[count($metas) - 1]['createdAt'] : null;
 
     // An anonymous list is the same for every visitor, so the browser (and the
@@ -471,9 +519,9 @@ if ($path === '/api/search' && $method === 'GET') {
 
     $metas = array_slice(store_search_videos($q), 0, $limit);
     $uid = premium_uid_optional();
-    $videos = array_map(function ($v) use ($uid) {
+    $videos = public_list_with_direct_links(array_map(function ($v) use ($uid) {
         return premium_shape_video(store_public_video($v), $v, $uid);
-    }, $metas);
+    }, $metas));
     if ($uid === '') {
         public_cache(15);
     }
@@ -494,7 +542,7 @@ if (preg_match('#^/api/videos/([^/]+)$#', $path, $m) && $method === 'GET') {
     // has no reason to wait for it.
     header('Content-Type: application/json');
     header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
-    echo json_encode(['ok' => true, 'data' => premium_shape_video(store_public_video($video), $video, premium_uid_optional())]);
+    echo json_encode(['ok' => true, 'data' => public_with_direct_links(premium_shape_video(store_public_video($video), $video, premium_uid_optional()))]);
 
     if (function_exists('fastcgi_finish_request')) {
         fastcgi_finish_request();

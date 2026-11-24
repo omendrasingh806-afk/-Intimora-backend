@@ -151,6 +151,32 @@ function publicVideo(v) {
   };
 }
 
+// Every public answer carries a BestFile *direct* link: the stored link is only
+// the file's page, and the signed CDN URL behind it expires. It is resolved
+// again for each response (never from an earlier answer) and keeps the page
+// link as `page_url` when BestFile does not answer.
+async function withDirectLinks(videos) {
+  return Promise.all((videos || []).map(async (v) => {
+    if (!v || typeof v !== "object") return v;
+    const page = v.bestfile && v.bestfile.download_link;
+    const trailerPage = v.trailerBestfile;
+    const [direct, trailerDirect] = await Promise.all([
+      page ? bestfile.bfGetCdnUrl(page, { fresh: true }) : null,
+      trailerPage ? bestfile.bfGetCdnUrl(trailerPage, { fresh: true }) : null,
+    ]);
+    if (direct && v.bestfile) {
+      v.bestfile.page_url = page;
+      v.bestfile.download_link = direct;
+      v.cdnUrl = direct;
+    }
+    if (trailerDirect) {
+      v.trailerPageUrl = trailerPage;
+      v.trailerBestfile = trailerDirect;
+    }
+    return v;
+  }));
+}
+
 // ---- admin auth ----
 function adminAuth(req, res, next) {
   const key = req.headers["x-api-key"];
@@ -200,7 +226,7 @@ app.get("/api/videos", async (req, res) => {
     const limit = Math.min(parseInt(req.query.limit, 10) || 12, 50);
     const metas = await store.listVideos(cursor, limit);
     const uid = await optionalUid(req);
-    const videos = await Promise.all(metas.map((m) => premium.shapeVideo(publicVideo(m), m, uid)));
+    const videos = await withDirectLinks(await Promise.all(metas.map((m) => premium.shapeVideo(publicVideo(m), m, uid))));
     const nextCursor = videos.length ? metas[metas.length - 1].createdAt : null;
     ok(res, { videos, nextCursor });
   } catch (e) { fail(res, e.message, 500); }
@@ -214,7 +240,7 @@ app.get("/api/search", async (req, res) => {
     const limit = Math.min(parseInt(req.query.limit, 10) || 12, 50);
     const metas = await store.searchVideos(q);
     const uid = await optionalUid(req);
-    const videos = await Promise.all(metas.slice(0, limit).map((m) => premium.shapeVideo(publicVideo(m), m, uid)));
+    const videos = await withDirectLinks(await Promise.all(metas.slice(0, limit).map((m) => premium.shapeVideo(publicVideo(m), m, uid))));
     ok(res, { videos, nextCursor: null });
   } catch (e) { fail(res, e.message, 500); }
 });
@@ -229,7 +255,7 @@ app.get("/api/videos/:id", async (req, res) => {
       v = await store.incrementViews(req.params.id);
       if (!v) return fail(res, "Video not found", 404);
     }
-    ok(res, await premium.shapeVideo(publicVideo(v), v, await optionalUid(req)));
+    ok(res, (await withDirectLinks([await premium.shapeVideo(publicVideo(v), v, await optionalUid(req))]))[0]);
   } catch (e) { fail(res, e.message, 500); }
 });
 

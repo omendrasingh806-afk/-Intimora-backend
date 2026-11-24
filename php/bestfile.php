@@ -98,8 +98,11 @@ function bestfile_request($method, $path, &$session, $opts = []) {
     $resp = @file_get_contents('https://' . BESTFILE_HOST . $path, false, $ctx);
     $status = 0;
     $effUrl = 'https://' . BESTFILE_HOST . $path;
-    if (!empty($http_response_header)) {
-        foreach ($http_response_header as $h) {
+    $responseHeaders = function_exists('http_get_last_response_headers')
+        ? (http_get_last_response_headers() ?: [])
+        : ($http_response_header ?? []);
+    if (!empty($responseHeaders)) {
+        foreach ($responseHeaders as $h) {
             if (preg_match('/^Set-Cookie:\s*(.*)$/i', $h, $m)) {
                 $session = bestfile_store_cookies($session, $m[1]);
             }
@@ -108,74 +111,39 @@ function bestfile_request($method, $path, &$session, $opts = []) {
     return [$status, $resp, $effUrl];
 }
 
-function bestfile_login() {
-    $session = bestfile_load_session();
-    // 1. Get login page + CSRF + cookies
-    $session['cookies'] = [];
-    [$st, $html] = bestfile_request('GET', '/en/login', $session);
-    $csrf = bestfile_csrf_from($html);
-    // 2. POST login
-    [$st, $body, $eff] = bestfile_request('POST', '/en/login', $session, [
-        'form' => ['_token' => $csrf, 'email' => BESTFILE_EMAIL, 'password' => BESTFILE_PASSWORD],
-    ]);
-    // Redirects are followed, so a successful login ends on /user (the followed
-    // request may answer 405) instead of the raw 302.
-    $loggedIn = ($st === 302) || stripos((string)$eff, '/user') !== false;
-    if (!$loggedIn) {
-        return false; // login failed (wrong email/password, or CSRF)
-    }
-    // 3. Refresh CSRF from an authenticated page
-    [$st, $html] = bestfile_request('GET', '/en', $session);
-    $session['csrf'] = bestfile_csrf_from($html);
-    bestfile_save_session($session);
-    return true;
-}
-
-function bestfile_ensure_login() {
-    $session = bestfile_load_session();
-    if (empty($session['cookies'])) {
-        if (!bestfile_login()) return false;
-        $session = bestfile_load_session();
-    }
-    // Always refresh CSRF (token expires ~2h)
-    [$st, $html] = bestfile_request('GET', '/en', $session);
-    $session['csrf'] = bestfile_csrf_from($html);
-    bestfile_save_session($session);
-    return true;
-}
-
 /**
  * Get a fresh CDN (B2) signed URL for a BestFile file.
  * Pass the download_link (page URL, e.g. https://bestfile.io/<id>/file).
  * Returns the direct Backblaze B2 URL, or false on failure.
+ *
+ * The file's own page hands out the CSRF token and the session cookie the
+ * create call needs. There is no sign-in step: /en/login is behind a bot
+ * challenge and answers 403, while the file page itself still works.
  */
 function bestfile_get_cdn_url($downloadLink) {
-    // Extract the page id from the download_link: https://bestfile.io/<id>/file
     if (!preg_match('#https?://' . preg_quote(BESTFILE_HOST, '#') . '/([^/]+)/file#i', $downloadLink, $m)) return false;
     $pageId = $m[1];
 
-    if (!bestfile_ensure_login()) return false;
-    $session = bestfile_load_session();
+    $session = ['cookies' => [], 'csrf' => ''];
+    [$st, $html] = bestfile_request('GET', '/en/' . rawurlencode($pageId) . '/file', $session);
+    $csrf = bestfile_csrf_from($html);
+    if ($st !== 200 || $csrf === '') return false;
 
-    // POST /<id>/download/create -> returns download_link (bestfile.io redirect chain)
-    [$st, $body, $eff] = bestfile_request('POST', '/' . $pageId . '/download/create', $session, [
-        'headers' => ['X-CSRF-TOKEN: ' . ($session['csrf'] ?? ''), 'Referer: https://' . BESTFILE_HOST . '/en'],
+    [$st2, $body] = bestfile_request('POST', '/' . $pageId . '/download/create', $session, [
+        'headers' => [
+            'X-CSRF-TOKEN: ' . $csrf,
+            'X-Requested-With: XMLHttpRequest',
+            'Accept: application/json',
+            'Referer: https://' . BESTFILE_HOST . '/en/' . $pageId . '/file',
+        ],
     ]);
-    if ($st !== 200) {
-        // Session may have expired -> re-login once
-        bestfile_login();
-        $session = bestfile_load_session();
-        [$st, $body, $eff] = bestfile_request('POST', '/' . $pageId . '/download/create', $session, [
-            'headers' => ['X-CSRF-TOKEN: ' . ($session['csrf'] ?? ''), 'Referer: https://' . BESTFILE_HOST . '/en'],
-        ]);
-        if ($st !== 200) return false;
-    }
+    if ($st2 !== 200) return false;
 
     $data = json_decode($body, true);
-    $link = $data['download_link'] ?? '';
-    if (!$link) return false;
+    $link = is_array($data) ? (string) ($data['download_link'] ?? '') : '';
+    if ($link === '') return false;
 
-    // Follow the redirect chain to the final Backblaze B2 signed URL (fetch only 1 byte).
+    // Follow the redirect chain to the final Backblaze B2 signed URL (1 byte).
     $headers = ['User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36'];
     if (!empty($session['cookies'])) $headers[] = 'Cookie: ' . bestfile_cookie_header($session['cookies']);
     $headers[] = 'Range: bytes=0-0';
@@ -197,10 +165,155 @@ function bestfile_get_cdn_url($downloadLink) {
         curl_close($ch);
         return $final ? $final : false;
     }
-    // Fallback: stream context
+    // Fallback: stream context (the client follows the redirect).
     $ctx = stream_context_create(['http' => ['method' => 'GET', 'header' => implode("\r\n", $headers), 'ignore_errors' => true, 'timeout' => 40, 'follow_location' => 10], 'ssl' => ['verify_peer' => true]]);
     $resp = @file_get_contents($link, false, $ctx);
     if (empty($resp)) return false;
-    // stream_context doesn't expose final URL reliably; return the link itself (client follows redirects)
     return $link;
 }
+
+// Page id of a BestFile page link, or '' when the link is not one.
+function bestfile_page_id($downloadLink) {
+    if (!is_string($downloadLink) || $downloadLink === '') return '';
+    if (!preg_match('#https?://' . preg_quote(BESTFILE_HOST, '#') . '/([^/]+)/file#i', $downloadLink, $m)) return '';
+    return $m[1];
+}
+
+// Run several curl handles at once and return their status, body and final URL.
+function bestfile_multi_run(array $handles) {
+    $mh = curl_multi_init();
+    foreach ($handles as $h) curl_multi_add_handle($mh, $h);
+    do {
+        $status = curl_multi_exec($mh, $running);
+        if ($running) curl_multi_select($mh, 1.0);
+    } while ($running && $status === CURLM_OK);
+
+    $out = [];
+    foreach ($handles as $key => $h) {
+        $out[$key] = [
+            'status' => (int) curl_getinfo($h, CURLINFO_HTTP_CODE),
+            'body' => (string) curl_multi_getcontent($h),
+            'url' => (string) curl_getinfo($h, CURLINFO_EFFECTIVE_URL),
+        ];
+        curl_multi_remove_handle($mh, $h);
+        curl_close($h);
+    }
+    curl_multi_close($mh);
+    return $out;
+}
+
+/**
+ * Resolve many page links to direct (B2) URLs in one batch, so a list of twelve
+ * videos costs one round of parallel requests instead of twelve slow chains.
+ * Returns link => direct URL; a link that could not be resolved is left out.
+ */
+function bestfile_get_cdn_urls(array $downloadLinks) {
+    $links = array_values(array_unique(array_filter(array_map('strval', $downloadLinks))));
+    if (!$links) return [];
+    if (!function_exists('curl_multi_init')) {
+        $out = [];
+        foreach ($links as $link) {
+            $direct = bestfile_get_cdn_url($link);
+            if (is_string($direct) && $direct !== '') $out[$link] = $direct;
+        }
+        return $out;
+    }
+
+    $ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36';
+    $pages = [];
+    $handles = [];
+
+    // 1. Every file page at once: it hands out the CSRF token and its cookies.
+    foreach ($links as $i => $link) {
+        $pageId = bestfile_page_id($link);
+        if ($pageId === '') continue;
+        $pages[$i] = ['link' => $link, 'pageId' => $pageId, 'cookies' => [], 'csrf' => '', 'download' => ''];
+        $ch = curl_init('https://' . BESTFILE_HOST . '/en/' . rawurlencode($pageId) . '/file');
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_FOLLOWLOCATION => true,
+            CURLOPT_MAXREDIRS => 5,
+            CURLOPT_CONNECTTIMEOUT => 10,
+            CURLOPT_TIMEOUT => 25,
+            CURLOPT_SSL_VERIFYPEER => true,
+            CURLOPT_USERAGENT => $ua,
+            CURLOPT_HEADERFUNCTION => function ($ch, $header) use (&$pages, $i) {
+                if (preg_match('/^Set-Cookie:\s*([^=]+)=([^;]*)/i', $header, $m)) {
+                    $pages[$i]['cookies'][trim($m[1])] = $m[2];
+                }
+                return strlen($header);
+            },
+        ]);
+        $handles[$i] = $ch;
+    }
+    if (!$handles) return [];
+
+    foreach (bestfile_multi_run($handles) as $i => $r) {
+        if ($r['status'] === 200) $pages[$i]['csrf'] = bestfile_csrf_from($r['body']);
+    }
+
+    // 2. Ask each page for its download link.
+    $handles = [];
+    foreach ($pages as $i => $p) {
+        if ($p['csrf'] === '') continue;
+        $ch = curl_init('https://' . BESTFILE_HOST . '/' . rawurlencode($p['pageId']) . '/download/create');
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_POST => true,
+            CURLOPT_POSTFIELDS => '',
+            CURLOPT_FOLLOWLOCATION => true,
+            CURLOPT_MAXREDIRS => 5,
+            CURLOPT_CONNECTTIMEOUT => 10,
+            CURLOPT_TIMEOUT => 25,
+            CURLOPT_SSL_VERIFYPEER => true,
+            CURLOPT_USERAGENT => $ua,
+            CURLOPT_HTTPHEADER => [
+                'Cookie: ' . bestfile_cookie_header($pages[$i]['cookies']),
+                'X-CSRF-TOKEN: ' . $p['csrf'],
+                'X-Requested-With: XMLHttpRequest',
+                'Accept: application/json',
+                'Referer: https://' . BESTFILE_HOST . '/en/' . $p['pageId'] . '/file',
+            ],
+        ]);
+        $handles[$i] = $ch;
+    }
+
+    foreach (bestfile_multi_run($handles) as $i => $r) {
+        if ($r['status'] !== 200) continue;
+        $data = json_decode($r['body'], true);
+        if (is_array($data) && !empty($data['download_link'])) {
+            $pages[$i]['download'] = (string) $data['download_link'];
+        }
+    }
+
+    // 3. Follow each download link to the signed Backblaze URL.
+    $handles = [];
+    foreach ($pages as $i => $p) {
+        if ($p['download'] === '') continue;
+        $ch = curl_init($p['download']);
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_HTTPGET => true,
+            CURLOPT_FOLLOWLOCATION => true,
+            CURLOPT_MAXREDIRS => 10,
+            CURLOPT_CONNECTTIMEOUT => 10,
+            CURLOPT_TIMEOUT => 25,
+            CURLOPT_SSL_VERIFYPEER => true,
+            CURLOPT_USERAGENT => $ua,
+            CURLOPT_HTTPHEADER => [
+                'Cookie: ' . bestfile_cookie_header($p['cookies']),
+                'Range: bytes=0-0',
+            ],
+        ]);
+        $handles[$i] = $ch;
+    }
+
+    $out = [];
+    foreach (bestfile_multi_run($handles) as $i => $r) {
+        if ($r['url'] !== '' && strpos($r['url'], BESTFILE_HOST) === false) {
+            $out[$pages[$i]['link']] = $r['url'];
+        }
+    }
+    return $out;
+}
+
