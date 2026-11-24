@@ -249,13 +249,17 @@ app.get("/api/videos/:id/stream", async (req, res) => {
     // required. The link never expires; for a full video the premium end time
     // carried inside the token decides whether it may play.
     const kind = req.query.kind === "trailer" ? "trailer" : "video";
-    if (premium.isPremiumVideo(v)) {
-      if (kind === "trailer" && !premium.hasTrailer(v)) return fail(res, "No trailer for this video", 404);
+    if (kind === "trailer") {
+      // A trailer is public: it plays logged in or logged out, with a token or
+      // without one. A premium video only has to actually have a trailer.
+      if (premium.isPremiumVideo(v) && !premium.hasTrailer(v)) return fail(res, "No trailer for this video", 404);
+    } else if (premium.isPremiumVideo(v)) {
+      // A full video is never served from a bare URL: the signed token says
+      // which account asked, and the ledger decides right now whether that
+      // account's premium is running.
       const payload = premium.checkToken(req.query.t, req.params.id, kind);
       if (!payload) return fail(res, "Invalid link — reload the page", 403);
-      // The link itself is permanent, so access is decided here, from the
-      // account it was issued to: premium must still be running for that uid.
-      if (kind === "video" && !(await premium.isActive(payload.u))) return fail(res, "Premium required", 403);
+      if (!(await premium.isActive(payload.u))) return fail(res, "Premium required", 403);
     }
     const source = kind === "trailer" ? (v.trailer || {}) : v;
     const bf = kind === "trailer" ? (source.bestfile || null) : v.bestfile;

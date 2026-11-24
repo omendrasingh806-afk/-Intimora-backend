@@ -256,7 +256,8 @@ async function shapeVideo(pub, video, uid) {
   pub.hasTrailer = trailer;
 
   if (!premium) {
-    if (trailer) pub.trailerUrl = `/api/videos/${encodeURIComponent(id)}/stream?kind=trailer&t=${token(uid, id, "trailer")}`;
+    // Public on purpose: a trailer needs no login and no token.
+    if (trailer) pub.trailerUrl = `/api/videos/${encodeURIComponent(id)}/stream?kind=trailer`;
     return pub;
   }
 
@@ -274,7 +275,8 @@ async function shapeVideo(pub, video, uid) {
   }
 
   if (trailer) {
-    pub.trailerUrl = `/api/videos/${encodeURIComponent(id)}/stream?kind=trailer&t=${token(uid, id, "trailer", until)}`;
+    // Public on purpose: the trailer plays even when the account is locked.
+    pub.trailerUrl = `/api/videos/${encodeURIComponent(id)}/stream?kind=trailer`;
   } else {
     delete pub.trailerUrl;
   }

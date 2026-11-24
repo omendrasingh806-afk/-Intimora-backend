@@ -732,6 +732,7 @@ async function doUpload(job, p) {
   job.temp.push(p.videoPath, p.thumbPath);
   if (p.trailerPath) job.temp.push(p.trailerPath);
   let finalPath = p.videoPath;
+  let trailerTg = null, trailerBf = null;
   const targets = job.targets.filter((t) => t === 'telegram' || t === 'bestfile');
   const hasTg = targets.includes('telegram');
   const hasBf = targets.includes('bestfile');
@@ -788,10 +789,6 @@ async function doUpload(job, p) {
     } else {
       jlog(job, 'Trailer: moov already at start → conversion skipped');
     }
-    if (!hasTg) {
-      jlog(job, '⚠️ Trailer needs the Telegram target; not uploaded.');
-      trailerPath = null;
-    }
   }
 
   // ---- Allocate percent ranges across selected targets ----
@@ -828,7 +825,7 @@ async function doUpload(job, p) {
       job.stage = '⬆️ Uploading trailer to Telegram…';
       const tmsg = await sendVideo(job, inputVideo, trailerPath, `${p.title} (trailer)`, null, Math.min(99, tgEnd - 1), Math.min(99, tgEnd - 1));
       const tdoc = tmsg.msg.document || tmsg.msg.media?.document;
-      tgInfo.trailer = {
+      trailerTg = {
         tg_doc_id: tdoc?.id ? String(tdoc.id) : '', tg_access_hash: tdoc?.accessHash ? String(tdoc.accessHash) : '',
         tg_file_ref: refToBase64(tdoc?.fileReference), tg_size: tdoc?.size ? Number(tdoc.size) : tmsg.size,
         tg_mime: tdoc?.mimeType || 'video/mp4', tg_channel: config.videoChannel, tg_msg_id: tmsg.msg.id,
@@ -880,6 +877,18 @@ async function doUpload(job, p) {
       jlog(job, 'Telegram upload continues; add the BestFile link later with the "BestFile link" button.');
     }
   }
+
+  // The trailer is stored on both sides as well: Telegram above, BestFile here.
+  if (hasBf && trailerPath) {
+    job.stage = '⬆️ Uploading trailer to BestFile…';
+    try {
+      trailerBf = await bfUpload(job, trailerPath, Math.min(99, bfStart), 100);
+      jlog(job, `Trailer on BestFile → ${trailerBf.download_link}`);
+    } catch (e) {
+      jlog(job, '⚠️ Trailer BestFile upload skipped: ' + e.message);
+    }
+  }
+
   const bfDone = !!bfInfo;
 
   // ---- Build metadata (BestFile link lives inside the metadata) ----
@@ -894,7 +903,14 @@ async function doUpload(job, p) {
   if (hasTg) {
     metadata.video = tgInfo.video;
     metadata.thumbnail = tgInfo.thumbnail;
-    if (tgInfo.trailer) metadata.trailer = tgInfo.trailer;
+  }
+  if (trailerTg || trailerBf) {
+    metadata.trailer = {
+      ...(trailerTg || {}),
+      ...(trailerBf
+        ? { bestfile: { download_id: trailerBf.download_id, download_link: trailerBf.download_link, size: fs.statSync(trailerPath).size } }
+        : {}),
+    };
   }
   if (bfDone) {
     metadata.bestfile = {

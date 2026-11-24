@@ -572,17 +572,21 @@ if (preg_match('#^/api/videos/([^/]+)/stream$#', $path, $m) && ($method === 'GET
     // required. The link never expires; for a full video the premium end time
     // carried inside the token decides whether it may play.
     $kind = (($_GET['kind'] ?? '') === 'trailer') ? 'trailer' : 'video';
-    if (premium_video_flag($video)) {
-        if ($kind === 'trailer' && !premium_has_trailer($video)) {
+    if ($kind === 'trailer') {
+        // A trailer is public: it plays logged in or logged out, with a token or
+        // without one. A premium video only has to actually have a trailer.
+        if (premium_video_flag($video) && !premium_has_trailer($video)) {
             json_fail('No trailer for this video', 404);
         }
+    } elseif (premium_video_flag($video)) {
+        // A full video is never served from a bare URL: the signed token says
+        // which account asked, and the ledger decides right now whether that
+        // account's premium is running.
         $payload = premium_token_check($_GET['t'] ?? '', urldecode($m[1]), $kind);
         if ($payload === null) {
             json_fail('Invalid link — reload the page', 403);
         }
-        // The link itself is permanent, so access is decided here, from the
-        // account it was issued to: premium must still be running for that uid.
-        if ($kind === 'video' && !premium_is_active((string) ($payload['u'] ?? ''))) {
+        if (!premium_is_active((string) ($payload['u'] ?? ''))) {
             json_fail('Premium required', 403);
         }
     }

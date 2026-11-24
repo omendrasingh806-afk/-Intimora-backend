@@ -423,8 +423,8 @@ function premium_shape_video($pub, $video, $uid) {
 
     if (!$isPremium) {
         if ($hasTrailer) {
-            $pub['trailerUrl'] = '/api/videos/' . rawurlencode((string) ($video['id'] ?? '')) . '/stream?kind=trailer&t='
-                . premium_token($uid, (string) ($video['id'] ?? ''), 'trailer');
+            // Public on purpose: a trailer needs no login and no token.
+            $pub['trailerUrl'] = '/api/videos/' . rawurlencode((string) ($video['id'] ?? '')) . '/stream?kind=trailer';
         }
         return $pub;
     }
@@ -447,8 +447,8 @@ function premium_shape_video($pub, $video, $uid) {
     }
 
     if ($hasTrailer) {
-        $pub['trailerUrl'] = '/api/videos/' . rawurlencode($id) . '/stream?kind=trailer&t='
-            . premium_token($uid, $id, 'trailer');
+        // Public on purpose: the trailer plays even when the account is locked.
+        $pub['trailerUrl'] = '/api/videos/' . rawurlencode($id) . '/stream?kind=trailer';
     } else {
         unset($pub['trailerUrl']);
     }
