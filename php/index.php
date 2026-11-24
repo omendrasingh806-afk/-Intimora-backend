@@ -402,6 +402,9 @@ if ($path === '/api/health' && ($method === 'GET' || $method === 'HEAD')) {
 
 // PHP-only debug route
 if ($path === '/api/debug' && $method === 'GET') {
+    if (function_exists('mtproto_autoload')) {
+        mtproto_autoload();
+    }
     json_ok([
         'php_version' => PHP_VERSION,
         'madeline_version' => class_exists('\danog\MadelineProto\API') ? 'installed' : 'NOT installed',
@@ -439,6 +442,14 @@ if ($path === '/api/videos' && $method === 'GET') {
     }, $metas);
     $nextCursor = $videos ? (int) $metas[count($metas) - 1]['createdAt'] : null;
 
+    // An anonymous list is the same for every visitor, so the browser (and the
+    // hosting proxy) may reuse it for a few seconds: repeat visits paint from
+    // disk instead of waiting for PHP. Signed-in lists carry per-user premium
+    // links and stay uncached.
+    if ($uid === '') {
+        public_cache(15);
+    }
+
     after_response(function () use ($metas) {
         warm_thumbs($metas, 3);
     });
@@ -463,6 +474,9 @@ if ($path === '/api/search' && $method === 'GET') {
     $videos = array_map(function ($v) use ($uid) {
         return premium_shape_video(store_public_video($v), $v, $uid);
     }, $metas);
+    if ($uid === '') {
+        public_cache(15);
+    }
     json_ok(['videos' => $videos, 'nextCursor' => null]);
 }
 

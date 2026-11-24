@@ -16,7 +16,18 @@ if (!defined('INTIMORA_MTPROTO')) {
 define('INTIMORA_MTPROTO', true);
 
 require_once __DIR__ . '/config.php';
-require_once __DIR__ . '/vendor/autoload.php';
+
+// The Composer autoloader boots the whole MadelineProto entry point. A cache hit
+// never talks to Telegram, so it is loaded only when a request really connects:
+// that keeps the fast path free of the MTProto boot cost.
+function mtproto_autoload() {
+    static $loaded = false;
+    if ($loaded) {
+        return;
+    }
+    $loaded = true;
+    require_once __DIR__ . '/vendor/autoload.php';
+}
 
 // === IPC handling ===
 // MadelineProto 8 normally runs the session in a background IPC worker process
@@ -65,6 +76,7 @@ function mtproto_parse_session_string($session) {
 }
 
 function mtproto_settings() {
+    mtproto_autoload();
     $settings = new Settings();
     $settings->getAppInfo()
         ->setApiId((int) TG_API_ID)
@@ -104,6 +116,7 @@ class MTProtoClient {
             return;
         }
 
+        mtproto_autoload();
         $path = mtproto_session_path();
 
         if (!file_exists($path)) {

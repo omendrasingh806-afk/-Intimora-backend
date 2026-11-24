@@ -38,6 +38,17 @@ function premium_ledger($fresh = false) {
         return $cache;
     }
 
+    // Disk copy: the ledger is appended to, never edited, so a minute-old copy
+    // is safe and saves a full premium-channel read on every status call.
+    if (!$fresh && function_exists('fc_get')) {
+        $disk = fc_get('prem_ledger', PREMIUM_LEDGER_TTL);
+        if (is_array($disk)) {
+            $cache = $disk;
+            $at = time();
+            return $cache;
+        }
+    }
+
     $entries = [];
     $messages = store_read_messages(TG_CHANNEL_PREMIUM);
     foreach ($messages as $msg) {
@@ -57,12 +68,21 @@ function premium_ledger($fresh = false) {
 
     $cache = $entries;
     $at = time();
+    if (function_exists('fc_set')) {
+        fc_set('prem_ledger', $entries);
+    }
     return $cache;
 }
 
 function premium_ledger_write($entry) {
     $entry['at'] = $entry['at'] ?? time();
     tg_send_message(TG_CHANNEL_PREMIUM, json_encode($entry, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+    if (function_exists('fc_forget')) {
+        fc_forget('prem_ledger');
+        if ((string) ($entry['uid'] ?? '') !== '') {
+            fc_forget('prem_until_' . sha1((string) $entry['uid']));
+        }
+    }
     premium_ledger(true); // refresh the read cache
     return $entry;
 }
@@ -465,37 +485,28 @@ function premium_shape_video($pub, $video, $uid) {
 // === Request helpers ========================================================
 
 // Firebase ID token → uid, or '' when there is no/invalid token.
+//
+// The body/query token is accepted too (the browser avoids a CORS preflight
+// that way) and the verified identity is reused from the same disk cache as
+// verify_firebase_token(): a signed-in visitor must not pay a Firebase round
+// trip on every video list request.
 function premium_uid_optional() {
-    $header = $_SERVER['HTTP_AUTHORIZATION'] ?? ($_SERVER['HTTP_X_AUTHORIZATION'] ?? '');
-    if (!preg_match('/^Bearer\s+(.+)$/i', (string) $header, $m)) {
-        return '';
+    $token = '';
+    if (function_exists('get_bearer_token')) {
+        $token = (string) (get_bearer_token() ?? '');
+    } else {
+        $header = $_SERVER['HTTP_AUTHORIZATION'] ?? ($_SERVER['HTTP_X_AUTHORIZATION'] ?? '');
+        if (preg_match('/^Bearer\s+(.+)$/i', (string) $header, $m)) {
+            $token = trim($m[1]);
+        }
     }
-    $token = trim($m[1]);
     if ($token === '') {
         return '';
     }
 
-    $url = 'https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=' . urlencode(FIREBASE_API_KEY);
-    $payload = json_encode(['idToken' => $token, 'maxResults' => 1]);
-
-    $ctx = stream_context_create([
-        'http' => [
-            'method' => 'POST',
-            'header' => "Content-Type: application/json\r\n",
-            'content' => $payload,
-            'timeout' => 6,
-            'ignore_errors' => true,
-        ],
-    ]);
-
-    $raw = @file_get_contents($url, false, $ctx);
-    if (!is_string($raw) || $raw === '') {
+    if (!function_exists('verify_firebase_token')) {
         return '';
     }
-    $data = json_decode($raw, true);
-    if (!is_array($data) || !empty($data['error'])) {
-        return '';
-    }
-
-    return (string) ($data['users'][0]['localId'] ?? '');
+    $decoded = verify_firebase_token($token);
+    return is_array($decoded) ? (string) ($decoded['localId'] ?? '') : '';
 }

@@ -21,24 +21,26 @@ require_once __DIR__ . '/config.php';
 require_once __DIR__ . '/fastcache.php';
 require_once __DIR__ . '/telegram.php';
 
-// How long the channel history is kept on disk (seconds). Writes clear it.
-// A short TTL made every new visitor wait for a full Telegram re-read, because
-// the first request after the TTL paid seconds of MTProto round trips.
+// How long the channel history is kept on disk (seconds). This is only the
+// freshness window: the copy is served immediately all the time, and once it is
+// older than this it is refreshed in the background after the response (only
+// the messages newer than the cached newest one are pulled). 15 s is short
+// enough that a video uploaded on the other backend shows up almost at once,
+// and long enough that a burst of visitors costs one refresh, not one each.
 if (!defined('STORE_DISK_TTL')) {
-    define('STORE_DISK_TTL', 3600);
+    define('STORE_DISK_TTL', 15);
 }
 // After the TTL the cached copy is still served immediately (stale-while-
 // revalidate) and only refreshed in the background, so no visitor ever waits.
 if (!defined('STORE_DISK_STALE')) {
     define('STORE_DISK_STALE', 604800);
 }
-// Fresh reads: the metadata is read from Telegram on every request instead of
-// being served from disk. The old disk cache could answer with an older copy of
-// the channel (a video showing wrong/missing data, then correct on the next
-// request). The per-request array below still de-duplicates the work inside one
-// request, so a request never reads the same channel twice.
+// Fresh reads are OFF: reading the whole channel from Telegram on every request
+// was the single slowest thing this backend did (each page is a network round
+// trip). The disk copy answers in milliseconds; writes patch it in place and
+// the background refresh keeps it current, so the data stays warm and correct.
 if (!defined('STORE_FRESH_READS')) {
-    define('STORE_FRESH_READS', true);
+    define('STORE_FRESH_READS', false);
 }
 
 // === In-Memory Cache (one request lifetime) ===
@@ -70,10 +72,9 @@ function store_cache($type, $data) {
     $_storeCache[$type]['data'] = $data;
     $_storeCache[$type]['time'] = time();
 
-    // Persist across requests only when fresh reads are disabled.
-    if (!STORE_FRESH_READS) {
-        fc_set('store_' . $type, $data);
-    }
+    // Persist across requests: the disk copy is what lets the next request
+    // answer without a single Telegram round trip.
+    fc_set('store_' . $type, $data);
 }
 
 function store_get_cache($type) {
@@ -116,6 +117,15 @@ function store_get_cache($type) {
 function store_has_stale() {
     global $_storeStale;
     return !empty($_storeStale);
+}
+
+// Age of a cached list in seconds, or null when nothing is cached.
+function store_cache_age($type) {
+    global $_storeCache;
+    if (isset($_storeCache[$type]['data']) && $_storeCache[$type]['data'] !== null) {
+        return max(0, time() - (int) $_storeCache[$type]['time']);
+    }
+    return fc_age('store_' . $type);
 }
 
 // Refresh the lists that were served stale. Runs after the response left the
@@ -376,11 +386,6 @@ function store_read_videos($force = false) {
 // The old cached list stays in place, so this is a few round trips instead of
 // re-reading the whole channel (which was the multi-second part).
 function store_refresh_videos() {
-    if (STORE_FRESH_READS) {
-        store_read_videos(true);
-        return;
-    }
-
     $old = fc_peek('store_videos');
     if (!is_array($old) || !$old) {
         store_read_videos(true);
@@ -564,17 +569,23 @@ function store_build_metadata($v) {
     ];
 }
 
-// Send a metadata JSON message to the meta channel, returns the message id
+// Send a metadata JSON message to the meta channel, returns the message id.
+// The warm list is patched instead of discarded: a write must never make the
+// next visitor pay a full channel re-read.
 function store_send_metadata($metadata) {
     $result = tg_send_message(TG_CHANNEL_META, json_encode($metadata, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
-    store_clear_cache('videos');
-    return tg_msg_id($result);
+    $msgId = tg_msg_id($result);
+    if ($msgId !== null) {
+        $metadata['_msgId'] = $msgId;
+    }
+    store_cache_store_video($metadata);
+    return $msgId;
 }
 
-// Edit an existing metadata message
+// Edit an existing metadata message (the caller patches the cache with the new
+// record, so the list stays warm)
 function store_edit_metadata($msgId, $metadata) {
     tg_edit_message(TG_CHANNEL_META, (int) $msgId, json_encode($metadata, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
-    store_clear_cache('videos');
 }
 
 // Add a new video; returns the stored metadata (with _msgId)
@@ -676,19 +687,100 @@ function store_register_external_video($id, $data) {
     return $metadata;
 }
 
+// === Cache patching ========================================================
+// Every write (new video, edit, delete, like, save) patches the warm list in
+// place. Clearing the cache instead would turn the next request into a full
+// Telegram re-read, which is exactly the multi-second wait this backend is
+// trying to avoid. A cold cache stays cold: the next read fills it normally.
+
+function store_videos_sort(&$list) {
+    usort($list, function ($a, $b) {
+        return ((int) ($b['createdAt'] ?? 0)) <=> ((int) ($a['createdAt'] ?? 0));
+    });
+}
+
+// Insert or replace one video record in the warm videos cache.
+function store_cache_store_video($record) {
+    global $_storeCache;
+    if (!is_array($record) || (string) ($record['id'] ?? '') === '') {
+        return;
+    }
+    if (!isset($_storeCache['videos']['data']) || !is_array($_storeCache['videos']['data'])) {
+        return;
+    }
+
+    $id = (string) $record['id'];
+    $list = $_storeCache['videos']['data'];
+    $found = false;
+    foreach ($list as $i => $v) {
+        if ((string) ($v['id'] ?? '') === $id) {
+            $list[$i] = $record;
+            $found = true;
+            break;
+        }
+    }
+    if (!$found) {
+        $list[] = $record;
+        store_videos_sort($list);
+    }
+    store_cache('videos', $list);
+}
+
 // Patch a single entry in the (possibly warm) cache after a write
 function store_cache_patch_video($videoId, $fresh) {
+    store_cache_store_video($fresh);
+}
+
+// Drop a deleted video from the warm cache.
+function store_cache_remove_video($videoId) {
     global $_storeCache;
     if (!isset($_storeCache['videos']['data']) || !is_array($_storeCache['videos']['data'])) {
         return;
     }
-    foreach ($_storeCache['videos']['data'] as $i => $v) {
-        if ((string) ($v['id'] ?? '') === (string) $videoId) {
-            $_storeCache['videos']['data'][$i] = $fresh;
-            $_storeCache['videos']['time'] = time();
-            return;
+    $list = array_values(array_filter($_storeCache['videos']['data'], function ($v) use ($videoId) {
+        return (string) ($v['id'] ?? '') !== (string) $videoId;
+    }));
+    store_cache('videos', $list);
+}
+
+// Insert or replace one user record in the warm users cache.
+function store_cache_store_user($record) {
+    global $_storeCache;
+    if (!is_array($record) || store_user_uid($record) === '') {
+        return;
+    }
+    if (!isset($_storeCache['users']['data']) || !is_array($_storeCache['users']['data'])) {
+        return;
+    }
+
+    $uid = store_user_uid($record);
+    $list = $_storeCache['users']['data'];
+    $found = false;
+    foreach ($list as $i => $u) {
+        if (store_user_uid($u) === $uid) {
+            $list[$i] = $record;
+            $found = true;
+            break;
         }
     }
+    if (!$found) {
+        $list[] = $record;
+    }
+    store_cache('users', $list);
+}
+
+// Insert or replace one user's like/save collection in the warm cache.
+function store_cache_store_collection($record) {
+    global $_storeCache;
+    $uid = (string) ($record['uid'] ?? '');
+    if ($uid === '') {
+        return;
+    }
+    if (!isset($_storeCache['collections']['data']) || !is_array($_storeCache['collections']['data'])) {
+        return;
+    }
+    $_storeCache['collections']['data'][$uid] = $record;
+    store_cache('collections', $_storeCache['collections']['data']);
 }
 
 // Merge $updates into a video's metadata message (edit in place)
@@ -824,7 +916,7 @@ function store_delete_video($videoId) {
         }
     }
 
-    store_clear_cache('videos');
+    store_cache_remove_video($videoId);
     return ['deleted' => true, 'channels' => $channels];
 }
 
@@ -940,7 +1032,7 @@ function store_create_user($params) {
         store_add_referral($user['referredBy'], $user['referralCode']);
     }
 
-    store_clear_cache('users');
+    store_cache_store_user($user);
     return $user;
 }
 
@@ -969,12 +1061,12 @@ function store_update_user($uid, $updates) {
 
     try {
         tg_edit_message(TG_CHANNEL_USERS, (int) $msgId, json_encode($data, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
-        store_clear_cache('users');
     } catch (\Throwable $e) {
         return null;
     }
 
     $data['_msgId'] = $msgId;
+    store_cache_store_user($data);
     return $data;
 }
 
@@ -1061,7 +1153,7 @@ function store_write_collection($record) {
         $data['_msgId'] = tg_msg_id($result);
     }
 
-    store_clear_cache('collections');
+    store_cache_store_collection($data);
     return $data;
 }
 
@@ -1081,6 +1173,13 @@ function store_user_with_collections($user) {
 }
 
 function store_toggle_user_like($uid, $videoId) {
+    // A toggle is a read-modify-write: never build the new list from a copy
+    // that another backend may already have moved on from.
+    $age = store_cache_age('collections');
+    if ($age !== null && $age > 3) {
+        store_read_collections(true);
+    }
+
     $collection = store_collection($uid);
     if ($collection === null) {
         return null;
@@ -1100,6 +1199,12 @@ function store_toggle_user_like($uid, $videoId) {
 }
 
 function store_toggle_user_save($uid, $videoId) {
+    // Same read-modify-write guard as a like.
+    $age = store_cache_age('collections');
+    if ($age !== null && $age > 3) {
+        store_read_collections(true);
+    }
+
     $collection = store_collection($uid);
     if ($collection === null) {
         return null;
