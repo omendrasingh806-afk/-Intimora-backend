@@ -266,6 +266,9 @@ function store_public_video($v) {
             'download_link' => $v['bestfile']['download_link'] ?? '',
             'size' => (int) ($v['bestfile']['size'] ?? 0),
         ],
+        // A trailer is public even when the video is premium, so its BestFile
+        // link is handed out with the rest of the public JSON.
+        'trailerBestfile' => (string) ($v['trailer']['bestfile']['download_link'] ?? ''),
     ];
 }
 

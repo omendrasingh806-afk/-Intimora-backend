@@ -145,6 +145,15 @@ function publicVideo(v) {
     embedUrl: external ? (v.embedUrl || "") : "",
     streamUrl: external ? null : `/api/videos/${v.id}/stream`,
     thumbnailUrl: external ? (v.thumbnailUrl || "") : `/api/videos/${v.id}/thumbnail`,
+    // The file's BestFile copy, so a client can link the CDN file directly
+    // instead of streaming the bytes through this server. A premium video gets
+    // this blanked by premium.shapeVideo; a trailer is public, so its link stays.
+    bestfile: {
+      download_id: (v.bestfile && v.bestfile.download_id) || "",
+      download_link: (v.bestfile && v.bestfile.download_link) || "",
+      size: (v.bestfile && Number(v.bestfile.size)) || 0,
+    },
+    trailerBestfile: (v.trailer && v.trailer.bestfile && v.trailer.bestfile.download_link) || "",
   };
 }
 
