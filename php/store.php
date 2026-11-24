@@ -205,6 +205,7 @@ function store_to_stream_format($m, $kind = 'video') {
 function store_public_video($v) {
     $video = $v['video'] ?? [];
     $thumb = $v['thumbnail'] ?? [];
+    $external = !empty($v['external']);
 
     return [
         'id' => $v['id'] ?? '',
@@ -222,8 +223,16 @@ function store_public_video($v) {
         'likes' => (int) ($v['likes'] ?? 0),
         'shares' => (int) ($v['shares'] ?? 0),
         'createdAt' => (int) ($v['createdAt'] ?? 0),
-        'streamUrl' => '/api/videos/' . ($v['id'] ?? '') . '/stream',
-        'thumbnailUrl' => '/api/videos/' . ($v['id'] ?? '') . '/thumbnail',
+        // A third-party video is played by its own source, so it carries no
+        // stream of ours and its poster is the URL the client sent.
+        'streamUrl' => $external ? null : '/api/videos/' . ($v['id'] ?? '') . '/stream',
+        'thumbnailUrl' => $external
+            ? (string) ($v['thumbnailUrl'] ?? '')
+            : '/api/videos/' . ($v['id'] ?? '') . '/thumbnail',
+        'external' => $external,
+        'source' => $external ? (string) ($v['source'] ?? '') : '',
+        'pageUrl' => $external ? (string) ($v['pageUrl'] ?? '') : '',
+        'embedUrl' => $external ? (string) ($v['embedUrl'] ?? '') : '',
         'bestfile' => [
             'download_id' => $v['bestfile']['download_id'] ?? '',
             'download_link' => $v['bestfile']['download_link'] ?? '',
@@ -427,7 +436,11 @@ function store_get_videos() {
 
 // Infinite scroll — cursor is the createdAt of the last item of the previous page
 function store_list_videos($cursor = 0, $limit = 12) {
-    $metas = store_read_videos();
+    // Third-party records exist only so a user can like/save them; they are not
+    // part of our catalogue and must never appear in a listing.
+    $metas = array_values(array_filter(store_read_videos(), function ($m) {
+        return empty($m['external']);
+    }));
 
     if ($cursor) {
         $start = 0;
@@ -454,6 +467,9 @@ function store_search_videos($query) {
     }
     $matches = [];
     foreach (store_read_videos() as $m) {
+        if (!empty($m['external'])) {
+            continue;
+        }
         if (mb_strpos(mb_strtolower((string) ($m['title'] ?? '')), $q) !== false) {
             $matches[] = $m;
         }
@@ -565,6 +581,97 @@ function store_add_video($videoData) {
     $metadata = store_build_metadata($videoData);
     $msgId = store_send_metadata($metadata);
     $metadata['_msgId'] = $msgId;
+    return $metadata;
+}
+
+// === Third-party (external) videos ===
+//
+// A video that lives on another host — a partner API, a scraped provider — is
+// not uploaded to our channels, so it used to have no record at all: a like or a
+// save was stored on the user, but the account could never show it again. The
+// first like/save now writes one small `external` metadata record, so the same
+// store, the same liked/saved lists and the same lookup work for it. That record
+// carries no Telegram file and is never streamed from us; it only remembers the
+// facts the client sent, each of them bounded.
+
+function store_external_id($id) {
+    $id = (string) $id;
+    return preg_match('/^[A-Za-z0-9_-]{1,128}$/', $id) === 1 ? $id : null;
+}
+
+function store_external_text($value, $max) {
+    if (!is_string($value)) {
+        return '';
+    }
+    $text = preg_replace('/[\x00-\x1f\x7f]+/u', ' ', $value);
+    $text = trim(preg_replace('/\s+/u', ' ', (string) $text));
+    return mb_substr($text, 0, (int) $max);
+}
+
+function store_external_url($value) {
+    if (!is_string($value)) {
+        return '';
+    }
+    $value = trim($value);
+    if ($value === '' || strlen($value) > 2048) {
+        return '';
+    }
+    $parts = parse_url($value);
+    if (!is_array($parts) || ($parts['scheme'] ?? '') !== 'https' || empty($parts['host'])) {
+        return '';
+    }
+    if (isset($parts['user']) || isset($parts['pass'])) {
+        return '';
+    }
+    return $value;
+}
+
+function store_build_external_metadata($id, $data) {
+    $videoId = store_external_id($id);
+    if ($videoId === null || !is_array($data)) {
+        return null;
+    }
+    $title = store_external_text($data['title'] ?? '', 300);
+    $thumbnail = store_external_url($data['thumbnailUrl'] ?? ($data['thumbnail'] ?? ''));
+    if ($title === '' || $thumbnail === '') {
+        return null;
+    }
+    $source = preg_replace('/[^a-z0-9-]/', '', strtolower(store_external_text($data['source'] ?? '', 32)));
+
+    return [
+        't' => 'meta',
+        'id' => $videoId,
+        'external' => true,
+        'source' => $source !== '' ? $source : 'external',
+        'title' => $title,
+        'description' => store_external_text($data['description'] ?? '', 1000),
+        'pageUrl' => store_external_url($data['pageUrl'] ?? ''),
+        'embedUrl' => store_external_url($data['embedUrl'] ?? ''),
+        'thumbnailUrl' => $thumbnail,
+        'duration' => max(0, (int) ($data['duration'] ?? 0)),
+        'views' => 0,
+        'likes' => 0,
+        'shares' => 0,
+        'likedBy' => [],
+        'createdAt' => time(),
+        'video' => [],
+        'thumbnail' => null,
+    ];
+}
+
+// Register a third-party video the first time it is liked or saved. A real
+// upload with the same id always wins, and an already registered id is reused so
+// a second user's like writes nothing new.
+function store_register_external_video($id, $data) {
+    $existing = store_get_video($id);
+    if ($existing) {
+        return empty($existing['external']) ? null : $existing;
+    }
+    $metadata = store_build_external_metadata($id, $data);
+    if ($metadata === null) {
+        return null;
+    }
+    $metadata['_msgId'] = store_send_metadata($metadata);
     return $metadata;
 }
 

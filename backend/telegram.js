@@ -519,6 +519,31 @@ function buildMetadata(v) {
   };
 }
 
+// A third-party video has no file of ours: this record only remembers the
+// public facts a client sent, so the same looked-up shape (id, title, poster,
+// link) can be returned for a like or a save without touching our catalogue.
+function buildExternalMetadata(v) {
+  return {
+    t: "meta",
+    id: v.id,
+    external: true,
+    source: v.source,
+    title: v.title,
+    description: v.description || "",
+    pageUrl: v.pageUrl || "",
+    embedUrl: v.embedUrl || "",
+    thumbnailUrl: v.thumbnailUrl,
+    duration: v.duration || 0,
+    views: 0,
+    likes: 0,
+    shares: 0,
+    likedBy: [],
+    createdAt: Math.floor(Date.now() / 1000),
+    video: {},
+    thumbnail: null,
+  };
+}
+
 // Send metadata as a text message. Returns the Telegram message id.
 async function sendMetadata(metadata) {
   const client = await getClient();
@@ -690,6 +715,7 @@ module.exports = {
   readFileRange,
   fetchThumbnail,
   buildMetadata,
+  buildExternalMetadata,
   sendMetadata,
   editMetadata,
   readMetadataFromTelegram,

@@ -512,6 +512,10 @@ if (preg_match('#^/api/videos/([^/]+)/thumbnail$#', $path, $m) && $method === 'G
     if (!$video) {
         json_fail('Video not found', 404);
     }
+    if (!empty($video['external'])) {
+        // Its poster lives on the other host and is already in thumbnailUrl.
+        json_fail('No thumbnail', 404);
+    }
 
     $stream = store_to_stream_format($video);
     if (empty($stream['thumb_doc_id'])) {
@@ -566,6 +570,10 @@ if (preg_match('#^/api/videos/([^/]+)/stream$#', $path, $m) && ($method === 'GET
     $video = store_get_video(urldecode($m[1]));
     if (!$video) {
         json_fail('Video not found', 404);
+    }
+    if (!empty($video['external'])) {
+        // We never host a third-party file, so there is nothing to stream.
+        json_fail('Video is hosted by its source', 404);
     }
 
     // Premium videos are never served from a bare URL: a signed token is
@@ -836,8 +844,17 @@ if ($path === '/api/auth/me' && ($method === 'GET' || $method === 'POST')) {
 // Like / unlike (updates the user's likedVideos, like the Node backend)
 if (preg_match('#^/api/videos/([^/]+)/like$#', $path, $m) && $method === 'POST') {
     $auth = require_auth();
+    $videoId = urldecode($m[1]);
 
-    $result = store_toggle_user_like($auth['uid'], urldecode($m[1]));
+    // A third-party video (one we never uploaded) is remembered the first time
+    // it is liked, so the account's liked list can show it again. The id is
+    // always the one in the URL; the body only supplies its public facts.
+    $body = json_body();
+    if (is_array($body['video'] ?? null)) {
+        store_register_external_video($videoId, $body['video']);
+    }
+
+    $result = store_toggle_user_like($auth['uid'], $videoId);
     if ($result === null) {
         json_fail('User not found', 404);
     }
@@ -848,8 +865,14 @@ if (preg_match('#^/api/videos/([^/]+)/like$#', $path, $m) && $method === 'POST')
 // Save / unsave
 if (preg_match('#^/api/videos/([^/]+)/save$#', $path, $m) && $method === 'POST') {
     $auth = require_auth();
+    $videoId = urldecode($m[1]);
 
-    $result = store_toggle_user_save($auth['uid'], urldecode($m[1]));
+    $body = json_body();
+    if (is_array($body['video'] ?? null)) {
+        store_register_external_video($videoId, $body['video']);
+    }
+
+    $result = store_toggle_user_save($auth['uid'], $videoId);
     if ($result === null) {
         json_fail('User not found', 404);
     }
@@ -859,10 +882,13 @@ if (preg_match('#^/api/videos/([^/]+)/save$#', $path, $m) && $method === 'POST')
 
 function json_videos_for_ids($ids) {
     $videos = [];
+    $uid = premium_uid_optional();
     foreach ((array) $ids as $id) {
         $v = store_get_video($id);
         if ($v) {
-            $videos[] = strip_internal($v);
+            // Shaped like every other video, so a third-party entry says where
+            // it is played (embedUrl/pageUrl) instead of claiming a stream.
+            $videos[] = premium_shape_video(store_public_video($v), $v, $uid);
         }
     }
     return $videos;

@@ -122,6 +122,9 @@ function fail(res, msg, code = 400) { return res.status(code).json({ ok: false, 
 
 // serialize video metadata for the public API
 function publicVideo(v) {
+  // A third-party record is played by its own source: it has no stream of ours
+  // and its poster is the URL the client sent when it was first liked/saved.
+  const external = v.external === true;
   return {
     id: v.id,
     title: v.title,
@@ -136,8 +139,12 @@ function publicVideo(v) {
     likes: v.likes,
     shares: v.shares,
     createdAt: v.createdAt,
-    streamUrl: `/api/videos/${v.id}/stream`,
-    thumbnailUrl: `/api/videos/${v.id}/thumbnail`,
+    external,
+    source: external ? (v.source || "") : "",
+    pageUrl: external ? (v.pageUrl || "") : "",
+    embedUrl: external ? (v.embedUrl || "") : "",
+    streamUrl: external ? null : `/api/videos/${v.id}/stream`,
+    thumbnailUrl: external ? (v.thumbnailUrl || "") : `/api/videos/${v.id}/thumbnail`,
   };
 }
 
@@ -214,8 +221,11 @@ app.get("/api/videos/:id", async (req, res) => {
   try {
     let v = await store.getVideo(req.params.id);
     if (!v) return fail(res, "Video not found", 404);
-    v = await store.incrementViews(req.params.id);
-    if (!v) return fail(res, "Video not found", 404);
+    // A third-party record has no view count of ours to edit.
+    if (v.external !== true) {
+      v = await store.incrementViews(req.params.id);
+      if (!v) return fail(res, "Video not found", 404);
+    }
     ok(res, await premium.shapeVideo(publicVideo(v), v, await optionalUid(req)));
   } catch (e) { fail(res, e.message, 500); }
 });
@@ -225,6 +235,8 @@ app.get("/api/videos/:id/thumbnail", async (req, res) => {
   try {
     const v = await store.getVideo(req.params.id);
     if (!v) return fail(res, "Video not found", 404);
+    // Its poster lives on the other host and is already in thumbnailUrl.
+    if (v.external === true) return fail(res, "No thumbnail", 404);
     if (!v.thumbnail) return fail(res, "No thumbnail", 404);
     const streamFormat = store.toStreamFormat(v);
     const img = await tg.fetchThumbnail(streamFormat);
@@ -244,6 +256,8 @@ app.get("/api/videos/:id/stream", async (req, res) => {
   try {
     const v = await store.getVideo(req.params.id);
     if (!v) return fail(res, "Video not found", 404);
+    // We never host a third-party file, so there is nothing to stream.
+    if (v.external === true) return fail(res, "Video is hosted by its source", 404);
 
     // Premium videos are never served from a bare URL: a signed token is
     // required. The link never expires; for a full video the premium end time
@@ -463,6 +477,12 @@ app.get("/api/auth/me", auth, async (req, res) => {
 // Like / unlike video (authenticated)
 app.post("/api/videos/:id/like", auth, async (req, res) => {
   try {
+    // A third-party video is remembered the first time it is liked, so the
+    // account's liked list can show it again. The id is always the URL's; the
+    // body only supplies its public facts, and is ignored for our own videos.
+    if (req.body && typeof req.body.video === "object" && req.body.video !== null) {
+      await store.registerExternalVideo(req.params.id, req.body.video);
+    }
     const result = await users.toggleLike(req.userId, req.params.id);
     if (!result) return fail(res, "User not found", 404);
     ok(res, result);
@@ -472,6 +492,9 @@ app.post("/api/videos/:id/like", auth, async (req, res) => {
 // Save / unsave video (authenticated)
 app.post("/api/videos/:id/save", auth, async (req, res) => {
   try {
+    if (req.body && typeof req.body.video === "object" && req.body.video !== null) {
+      await store.registerExternalVideo(req.params.id, req.body.video);
+    }
     const result = await users.toggleSave(req.userId, req.params.id);
     if (!result) return fail(res, "User not found", 404);
     ok(res, result);
@@ -483,10 +506,13 @@ app.get("/api/user/liked", auth, async (req, res) => {
   try {
     const likedIds = await users.getLikedVideos(req.userId);
     if (!likedIds) return fail(res, "User not found", 404);
+    const uid = await optionalUid(req);
     const videos = [];
     for (const id of likedIds) {
       const v = await store.getVideo(id);
-      if (v) videos.push(v);
+      // Shaped like every other video, so a third-party entry says where it is
+      // played (embedUrl/pageUrl) instead of claiming a stream of ours.
+      if (v) videos.push(await premium.shapeVideo(publicVideo(v), v, uid));
     }
     ok(res, { videos });
   } catch (e) { fail(res, e.message, 500); }
@@ -497,10 +523,11 @@ app.get("/api/user/saved", auth, async (req, res) => {
   try {
     const savedIds = await users.getSavedVideos(req.userId);
     if (!savedIds) return fail(res, "User not found", 404);
+    const uid = await optionalUid(req);
     const videos = [];
     for (const id of savedIds) {
       const v = await store.getVideo(id);
-      if (v) videos.push(v);
+      if (v) videos.push(await premium.shapeVideo(publicVideo(v), v, uid));
     }
     ok(res, { videos });
   } catch (e) { fail(res, e.message, 500); }

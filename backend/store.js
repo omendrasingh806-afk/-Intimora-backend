@@ -28,7 +28,9 @@ function toStreamFormat(m) {
 // ---- List videos (infinite scroll) ----
 // Fetches all metadata messages, sorts by createdAt desc, paginates by cursor.
 async function listVideos(cursor, limit = 12) {
-  const metas = await tg.readMetadataFromTelegram(5000);
+  // Third-party records exist only so a user can like/save them; they are not
+  // part of our catalogue and must never appear in a listing.
+  const metas = (await tg.readMetadataFromTelegram(5000)).filter(m => m.external !== true);
   metas.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
   if (cursor) {
     const idx = metas.findIndex(m => (m.createdAt || 0) <= cursor);
@@ -45,9 +47,71 @@ async function getVideo(id) {
 
 // ---- Search videos by title ----
 async function searchVideos(query) {
-  const metas = await tg.readMetadataFromTelegram(5000);
+  const metas = (await tg.readMetadataFromTelegram(5000)).filter(m => m.external !== true);
   const q = query.toLowerCase().trim();
   return metas.filter(m => (m.title || "").toLowerCase().includes(q));
+}
+
+// ---- Third-party (external) videos ----
+// A video hosted elsewhere had no record at all, so a like or a save was stored
+// on the user but the account could never show it again. The first like/save
+// writes one small `external` metadata record, so the same store, the same
+// liked/saved lists and the same lookup work for it. Every field is bounded and
+// only the client's public facts are kept; no Telegram file is involved.
+const EXTERNAL_ID = /^[A-Za-z0-9_-]{1,128}$/;
+
+function externalText(value, max) {
+  if (typeof value !== "string") return "";
+  return value.replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim().slice(0, max);
+}
+
+function externalUrl(value) {
+  if (typeof value !== "string" || value.length > 2048) return "";
+  try {
+    const url = new URL(value.trim());
+    if (url.protocol !== "https:" || url.username || url.password) return "";
+    return url.href;
+  } catch {
+    return "";
+  }
+}
+
+function externalRecord(id, data) {
+  const videoId = typeof id === "string" ? id : "";
+  if (!EXTERNAL_ID.test(videoId) || !data || typeof data !== "object") return null;
+  const title = externalText(data.title, 300);
+  const thumbnailUrl = externalUrl(data.thumbnailUrl || data.thumbnail);
+  if (!title || !thumbnailUrl) return null;
+  const source = externalText(data.source, 32).toLowerCase().replace(/[^a-z0-9-]/g, "");
+  return tg.buildExternalMetadata({
+    id: videoId,
+    source: source || "external",
+    title,
+    description: externalText(data.description, 1000),
+    pageUrl: externalUrl(data.pageUrl),
+    embedUrl: externalUrl(data.embedUrl),
+    thumbnailUrl,
+    duration: Number.isFinite(Number(data.duration)) ? Math.max(0, Math.trunc(Number(data.duration))) : 0,
+  });
+}
+
+// A real upload with the same id always wins, and an already registered id is
+// reused so a second user's like writes nothing new. `findVideoById` walks the
+// channel, so a warm isolate remembers what it already resolved.
+const externalSeen = new Set();
+
+async function registerExternalVideo(id, data) {
+  if (externalSeen.has(id)) return null;
+  const existing = await tg.findVideoById(id);
+  if (existing) {
+    if (existing.external === true) externalSeen.add(id);
+    return existing.external === true ? existing : null;
+  }
+  const metadata = externalRecord(id, data);
+  if (!metadata) return null;
+  const msgId = await tg.sendMetadata(metadata);
+  externalSeen.add(id);
+  return { ...metadata, _msgId: msgId };
 }
 
 // ---- Add video (send metadata to Telegram) ----
@@ -110,6 +174,7 @@ module.exports = {
   getVideo,
   searchVideos,
   addVideo,
+  registerExternalVideo,
   incrementViews,
   toggleLike,
   incrementShares,

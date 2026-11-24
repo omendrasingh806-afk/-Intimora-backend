@@ -421,6 +421,12 @@ function premium_shape_video($pub, $video, $uid) {
     $pub['premium'] = $isPremium;
     $pub['hasTrailer'] = $hasTrailer;
 
+    // A third-party video is played by its own source: there is no stream of
+    // ours to gate and nothing to unlock.
+    if (!empty($pub['external'])) {
+        return $pub;
+    }
+
     if (!$isPremium) {
         if ($hasTrailer) {
             // Public on purpose: a trailer needs no login and no token.
