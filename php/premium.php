@@ -90,11 +90,26 @@ function premium_until($uid, $fresh = false) {
 }
 
 function premium_is_active($uid, $at = null) {
-    if ($uid === '' || $uid === null) {
+    $uid = (string) $uid;
+    if ($uid === '') {
         return false;
     }
     $at = $at ?? time();
-    return premium_until($uid) > $at;
+
+    // The stream route asks this on every range request, so the ledger answer
+    // is kept for a minute per user: seeking must not read Telegram each time.
+    if (function_exists('fc_get')) {
+        $cached = fc_get('prem_until_' . sha1($uid), 60);
+        if (is_int($cached)) {
+            return $cached > $at;
+        }
+    }
+
+    $until = premium_until($uid);
+    if (function_exists('fc_set')) {
+        fc_set('prem_until_' . sha1($uid), $until);
+    }
+    return $until > $at;
 }
 
 // Which of the user's referrals are still unspent.

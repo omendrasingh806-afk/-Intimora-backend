@@ -245,7 +245,9 @@ app.get("/api/videos/:id/stream", async (req, res) => {
       if (kind === "trailer" && !premium.hasTrailer(v)) return fail(res, "No trailer for this video", 404);
       const payload = premium.checkToken(req.query.t, req.params.id, kind);
       if (!payload) return fail(res, "Invalid link — reload the page", 403);
-      if (kind === "video" && Number(payload.p) * 1000 <= Date.now()) return fail(res, "Premium required", 403);
+      // The link itself is permanent, so access is decided here, from the
+      // account it was issued to: premium must still be running for that uid.
+      if (kind === "video" && !(await premium.isActive(payload.u))) return fail(res, "Premium required", 403);
     }
     const source = kind === "trailer" ? (v.trailer || {}) : v;
     const bf = kind === "trailer" ? (source.bestfile || null) : v.bestfile;

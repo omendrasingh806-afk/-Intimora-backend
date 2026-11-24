@@ -580,7 +580,9 @@ if (preg_match('#^/api/videos/([^/]+)/stream$#', $path, $m) && ($method === 'GET
         if ($payload === null) {
             json_fail('Invalid link — reload the page', 403);
         }
-        if ($kind === 'video' && (int) ($payload['p'] ?? 0) <= time()) {
+        // The link itself is permanent, so access is decided here, from the
+        // account it was issued to: premium must still be running for that uid.
+        if ($kind === 'video' && !premium_is_active((string) ($payload['u'] ?? ''))) {
             json_fail('Premium required', 403);
         }
     }

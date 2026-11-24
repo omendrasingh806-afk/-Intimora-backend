@@ -730,6 +730,7 @@ async function bfBrowserUpload(filePath, tick, size) {
 // ================= Job: upload =================
 async function doUpload(job, p) {
   job.temp.push(p.videoPath, p.thumbPath);
+  if (p.trailerPath) job.temp.push(p.trailerPath);
   let finalPath = p.videoPath;
   const targets = job.targets.filter((t) => t === 'telegram' || t === 'bestfile');
   const hasTg = targets.includes('telegram');
@@ -763,6 +764,36 @@ async function doUpload(job, p) {
     jlog(job, 'moov already at start → conversion skipped');
   }
 
+  // ---- Trailer: the same fast-start treatment as the video ----
+  // The trailer is streamed by the same byte route, so its moov atom has to sit
+  // before mdat too; otherwise the player has to hunt through the file before
+  // it can show the first frame.
+  let trailerPath = p.trailerPath || null;
+  if (trailerPath) {
+    job.stage = 'Trailer: checking where moov atom is…';
+    const tinfo = analyzeMp4(trailerPath);
+    jlog(job, `Trailer atoms: ${tinfo.atoms.slice(0, 6).join(', ')} → ${tinfo.fastStart ? 'moov at START (fast-start OK)' : 'NOT fast-start'}`);
+    const tExt = path.extname(p.trailerName || '').toLowerCase();
+    if (!tinfo.fastStart || tExt !== '.mp4') {
+      if (!ffmpegAvailable) throw new Error('ffmpeg not found — cannot make the trailer fast-start. Run "npm install" or install ffmpeg.');
+      const tOut = path.join(WORK_DIR, `fst-${job.id}.mp4`);
+      job.temp.push(tOut);
+      job.stage = 'Trailer: moving moov to start (no re-encode)…';
+      jlog(job, 'Trailer: converting to fast-start');
+      await remuxFastStart(trailerPath, tOut, () => {});
+      if (!analyzeMp4(tOut).fastStart) throw new Error('Converted trailer still is not fast-start');
+      rm(trailerPath);
+      trailerPath = tOut;
+      jlog(job, `Trailer converted OK — moov is now at the START (${fmtBytes(fs.statSync(tOut).size)})`);
+    } else {
+      jlog(job, 'Trailer: moov already at start → conversion skipped');
+    }
+    if (!hasTg) {
+      jlog(job, '⚠️ Trailer needs the Telegram target; not uploaded.');
+      trailerPath = null;
+    }
+  }
+
   // ---- Allocate percent ranges across selected targets ----
   let cursor = upFrom;
   let tgEnd = 100, bfStart = cursor;
@@ -790,6 +821,21 @@ async function doUpload(job, p) {
     job.stage = '⬆️ Uploading video to Telegram…';
     const { msg: videoMsg, size } = await sendVideo(job, inputVideo, finalPath, p.title, p.thumbPath, cursor, tgEnd);
     step(job, 'video', 'done');
+
+    // The trailer lives in the same Telegram video channel, so the player
+    // streams it from there and the metadata message carries its ids.
+    if (trailerPath) {
+      job.stage = '⬆️ Uploading trailer to Telegram…';
+      const tmsg = await sendVideo(job, inputVideo, trailerPath, `${p.title} (trailer)`, null, Math.min(99, tgEnd - 1), Math.min(99, tgEnd - 1));
+      const tdoc = tmsg.msg.document || tmsg.msg.media?.document;
+      tgInfo.trailer = {
+        tg_doc_id: tdoc?.id ? String(tdoc.id) : '', tg_access_hash: tdoc?.accessHash ? String(tdoc.accessHash) : '',
+        tg_file_ref: refToBase64(tdoc?.fileReference), tg_size: tdoc?.size ? Number(tdoc.size) : tmsg.size,
+        tg_mime: tdoc?.mimeType || 'video/mp4', tg_channel: config.videoChannel, tg_msg_id: tmsg.msg.id,
+        tg_filename: (p.trailerName || 'trailer.mp4').replace(/\.[^.]+$/, '') + '.mp4',
+      };
+      jlog(job, `Trailer uploaded to Telegram (msg ${tmsg.msg.id})`);
+    }
 
     step(job, 'thumb', 'running');
     job.stage = '⬆️ Uploading thumbnail to Telegram…'; job.percent = Math.min(99, tgEnd - 1);
@@ -845,7 +891,11 @@ async function doUpload(job, p) {
     views: 0, likes: 0, shares: 0, likedBy: [], duration,
     createdAt: Math.floor(Date.now() / 1000),
   };
-  if (hasTg) { metadata.video = tgInfo.video; metadata.thumbnail = tgInfo.thumbnail; }
+  if (hasTg) {
+    metadata.video = tgInfo.video;
+    metadata.thumbnail = tgInfo.thumbnail;
+    if (tgInfo.trailer) metadata.trailer = tgInfo.trailer;
+  }
   if (bfDone) {
     metadata.bestfile = {
       download_id: bfInfo.download_id, download_link: bfInfo.download_link,
@@ -1086,9 +1136,9 @@ function parseTargets(raw) {
 }
 
 // Upload: returns immediately with a jobId; everything else runs as a tracked job.
-app.post('/api/upload', upload.fields([{ name: 'video', maxCount: 1 }, { name: 'thumb', maxCount: 1 }]), (req, res) => {
-  const v = req.files?.video?.[0], t = req.files?.thumb?.[0];
-  const bad = (msg) => { rm(v?.path); rm(t?.path); res.status(400).json({ ok: false, error: msg }); };
+app.post('/api/upload', upload.fields([{ name: 'video', maxCount: 1 }, { name: 'thumb', maxCount: 1 }, { name: 'trailer', maxCount: 1 }]), (req, res) => {
+  const v = req.files?.video?.[0], t = req.files?.thumb?.[0], tr = req.files?.trailer?.[0];
+  const bad = (msg) => { rm(v?.path); rm(t?.path); rm(tr?.path); res.status(400).json({ ok: false, error: msg }); };
   if (!req.body.title) return bad('Title required');
   if (!v) return bad('Video required');
   const targets = parseTargets(req.body.targets);
@@ -1098,6 +1148,7 @@ app.post('/api/upload', upload.fields([{ name: 'video', maxCount: 1 }, { name: '
   runJob(job, (j) => doUpload(j, {
     title: req.body.title, description: req.body.description, exclusive: req.body.exclusive === 'true', premium: req.body.premium === 'true',
     duration: parseInt(req.body.duration) || 0, videoPath: v.path, thumbPath: t?.path, thumbSize: t?.size || 0, origName: v.originalname,
+    trailerPath: tr?.path, trailerName: tr?.originalname,
   }));
   res.json({ ok: true, data: { jobId: job.id, targets } });
 });
