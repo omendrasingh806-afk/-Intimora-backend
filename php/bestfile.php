@@ -179,141 +179,47 @@ function bestfile_page_id($downloadLink) {
     return $m[1];
 }
 
-// Run several curl handles at once and return their status, body and final URL.
-function bestfile_multi_run(array $handles) {
-    $mh = curl_multi_init();
-    foreach ($handles as $h) curl_multi_add_handle($mh, $h);
-    do {
-        $status = curl_multi_exec($mh, $running);
-        if ($running) curl_multi_select($mh, 1.0);
-    } while ($running && $status === CURLM_OK);
-
-    $out = [];
-    foreach ($handles as $key => $h) {
-        $out[$key] = [
-            'status' => (int) curl_getinfo($h, CURLINFO_HTTP_CODE),
-            'body' => (string) curl_multi_getcontent($h),
-            'url' => (string) curl_getinfo($h, CURLINFO_EFFECTIVE_URL),
-        ];
-        curl_multi_remove_handle($mh, $h);
-        curl_close($h);
+// A direct link is reused for a few minutes: the signed URL itself lives an
+// hour, and this host disables curl_multi, so resolving twelve of them inside one
+// list request would run past the execution limit. The stream route still asks
+// BestFile again on every play.
+function bestfile_direct_link($downloadLink) {
+    $link = (string) $downloadLink;
+    if ($link === '') return '';
+    $key = 'bfu_' . sha1($link);
+    if (function_exists('fc_get')) {
+        $hit = fc_get($key, 300);
+        if (is_string($hit) && $hit !== '') return $hit;
     }
-    curl_multi_close($mh);
-    return $out;
+    $url = bestfile_get_cdn_url($link);
+    if (is_string($url) && $url !== '') {
+        if (function_exists('fc_set')) fc_set($key, $url);
+        return $url;
+    }
+    return '';
 }
 
 /**
- * Resolve many page links to direct (B2) URLs in one batch, so a list of twelve
- * videos costs one round of parallel requests instead of twelve slow chains.
- * Returns link => direct URL; a link that could not be resolved is left out.
+ * Resolve the page links of one list. Cached links are free; uncached ones are
+ * resolved in order until the time budget is spent, so a cold list stays inside
+ * the host's execution limit and fills in on the next requests.
  */
-function bestfile_get_cdn_urls(array $downloadLinks) {
-    $links = array_values(array_unique(array_filter(array_map('strval', $downloadLinks))));
-    if (!$links) return [];
-    if (!function_exists('curl_multi_init')) {
-        $out = [];
-        foreach ($links as $link) {
-            $direct = bestfile_get_cdn_url($link);
-            if (is_string($direct) && $direct !== '') $out[$link] = $direct;
-        }
-        return $out;
-    }
-
-    $ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36';
-    $pages = [];
-    $handles = [];
-
-    // 1. Every file page at once: it hands out the CSRF token and its cookies.
-    foreach ($links as $i => $link) {
-        $pageId = bestfile_page_id($link);
-        if ($pageId === '') continue;
-        $pages[$i] = ['link' => $link, 'pageId' => $pageId, 'cookies' => [], 'csrf' => '', 'download' => ''];
-        $ch = curl_init('https://' . BESTFILE_HOST . '/en/' . rawurlencode($pageId) . '/file');
-        curl_setopt_array($ch, [
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_FOLLOWLOCATION => true,
-            CURLOPT_MAXREDIRS => 5,
-            CURLOPT_CONNECTTIMEOUT => 10,
-            CURLOPT_TIMEOUT => 25,
-            CURLOPT_SSL_VERIFYPEER => true,
-            CURLOPT_USERAGENT => $ua,
-            CURLOPT_HEADERFUNCTION => function ($ch, $header) use (&$pages, $i) {
-                if (preg_match('/^Set-Cookie:\s*([^=]+)=([^;]*)/i', $header, $m)) {
-                    $pages[$i]['cookies'][trim($m[1])] = $m[2];
-                }
-                return strlen($header);
-            },
-        ]);
-        $handles[$i] = $ch;
-    }
-    if (!$handles) return [];
-
-    foreach (bestfile_multi_run($handles) as $i => $r) {
-        if ($r['status'] === 200) $pages[$i]['csrf'] = bestfile_csrf_from($r['body']);
-    }
-
-    // 2. Ask each page for its download link.
-    $handles = [];
-    foreach ($pages as $i => $p) {
-        if ($p['csrf'] === '') continue;
-        $ch = curl_init('https://' . BESTFILE_HOST . '/' . rawurlencode($p['pageId']) . '/download/create');
-        curl_setopt_array($ch, [
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_POST => true,
-            CURLOPT_POSTFIELDS => '',
-            CURLOPT_FOLLOWLOCATION => true,
-            CURLOPT_MAXREDIRS => 5,
-            CURLOPT_CONNECTTIMEOUT => 10,
-            CURLOPT_TIMEOUT => 25,
-            CURLOPT_SSL_VERIFYPEER => true,
-            CURLOPT_USERAGENT => $ua,
-            CURLOPT_HTTPHEADER => [
-                'Cookie: ' . bestfile_cookie_header($pages[$i]['cookies']),
-                'X-CSRF-TOKEN: ' . $p['csrf'],
-                'X-Requested-With: XMLHttpRequest',
-                'Accept: application/json',
-                'Referer: https://' . BESTFILE_HOST . '/en/' . $p['pageId'] . '/file',
-            ],
-        ]);
-        $handles[$i] = $ch;
-    }
-
-    foreach (bestfile_multi_run($handles) as $i => $r) {
-        if ($r['status'] !== 200) continue;
-        $data = json_decode($r['body'], true);
-        if (is_array($data) && !empty($data['download_link'])) {
-            $pages[$i]['download'] = (string) $data['download_link'];
-        }
-    }
-
-    // 3. Follow each download link to the signed Backblaze URL.
-    $handles = [];
-    foreach ($pages as $i => $p) {
-        if ($p['download'] === '') continue;
-        $ch = curl_init($p['download']);
-        curl_setopt_array($ch, [
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_HTTPGET => true,
-            CURLOPT_FOLLOWLOCATION => true,
-            CURLOPT_MAXREDIRS => 10,
-            CURLOPT_CONNECTTIMEOUT => 10,
-            CURLOPT_TIMEOUT => 25,
-            CURLOPT_SSL_VERIFYPEER => true,
-            CURLOPT_USERAGENT => $ua,
-            CURLOPT_HTTPHEADER => [
-                'Cookie: ' . bestfile_cookie_header($p['cookies']),
-                'Range: bytes=0-0',
-            ],
-        ]);
-        $handles[$i] = $ch;
-    }
-
+function bestfile_get_cdn_urls(array $downloadLinks, $budgetSeconds = 8.0) {
     $out = [];
-    foreach (bestfile_multi_run($handles) as $i => $r) {
-        if ($r['url'] !== '' && strpos($r['url'], BESTFILE_HOST) === false) {
-            $out[$pages[$i]['link']] = $r['url'];
+    $deadline = microtime(true) + $budgetSeconds;
+    foreach (array_unique(array_map('strval', $downloadLinks)) as $link) {
+        if ($link === '') continue;
+        $key = 'bfu_' . sha1($link);
+        if (function_exists('fc_get')) {
+            $hit = fc_get($key, 300);
+            if (is_string($hit) && $hit !== '') { $out[$link] = $hit; continue; }
+        }
+        if (microtime(true) >= $deadline) continue;
+        $url = bestfile_get_cdn_url($link);
+        if (is_string($url) && $url !== '') {
+            $out[$link] = $url;
+            if (function_exists('fc_set')) fc_set($key, $url);
         }
     }
     return $out;
 }
-

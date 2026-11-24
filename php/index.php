@@ -435,8 +435,7 @@ function public_with_direct_links(array $pub, $resolved = null) {
         $link = (string) $link;
         if ($link === '') return '';
         if ($resolved === null) {
-            $url = bestfile_get_cdn_url($link);
-            return is_string($url) ? $url : '';
+            return bestfile_direct_link($link);
         }
         return (string) ($resolved[$link] ?? '');
     };

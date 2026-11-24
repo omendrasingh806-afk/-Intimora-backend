@@ -161,8 +161,8 @@ async function withDirectLinks(videos) {
     const page = v.bestfile && v.bestfile.download_link;
     const trailerPage = v.trailerBestfile;
     const [direct, trailerDirect] = await Promise.all([
-      page ? bestfile.bfGetCdnUrl(page, { fresh: true }) : null,
-      trailerPage ? bestfile.bfGetCdnUrl(trailerPage, { fresh: true }) : null,
+      page ? bestfile.bfGetCdnUrl(page) : null,
+      trailerPage ? bestfile.bfGetCdnUrl(trailerPage) : null,
     ]);
     if (direct && v.bestfile) {
       v.bestfile.page_url = page;

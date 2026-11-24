@@ -16,7 +16,10 @@ const BF_UA =
 
 // Every network call is bounded: a serverless request must never hang on BestFile.
 const REQ_TIMEOUT_MS = 8000;
-const CDN_TTL_MS = 45 * 60 * 1000; // B2 signed URLs are valid for 1 hour
+// A resolved link is reused for a few minutes: the signed URL itself lives an
+// hour, so a page of videos is not re-resolved on every load. The stream route
+// asks BestFile again for each play.
+const CDN_TTL_MS = 5 * 60 * 1000;
 
 const cdnCache = new Map(); // pageId -> { url, exp }
 
