@@ -164,15 +164,21 @@ function premium_referral_slots($uid) {
     ];
 }
 
+// Live premium state. `until` and `serverNow` are real UTC epoch seconds, and
+// everything is derived on every read: nothing is stored as a running counter,
+// so a closed window can never keep reporting time left. The client compares
+// serverNow with its own clock to fix drift and trusts `active` from here only.
 function premium_status($uid) {
-    $until = premium_until((string) $uid);
+    $until = (int) premium_until((string) $uid);
     $now = time();
+    $active = $until > $now;
     $slots = premium_referral_slots($uid);
 
     return [
-        'active' => $until > $now,
-        'until' => $until,
-        'remainingSeconds' => max(0, $until - $now),
+        'active' => $active,
+        'until' => $active ? $until : 0,
+        'serverNow' => $now,
+        'remainingSeconds' => $active ? ($until - $now) : 0,
         'referrals' => [
             'total' => $slots['total'],
             'used' => $slots['used'],

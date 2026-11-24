@@ -110,6 +110,14 @@ const PORT = parseInt(process.env.PORT, 10) || 10000;
 
 // ---- helpers ----
 function ok(res, data) { return res.json({ ok: true, data }); }
+// Premium answers must never be frozen by a browser or a proxy: the state is
+// decided from the clock on every call.
+function noStore(res) {
+  res.set("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+  res.set("Pragma", "no-cache");
+  res.set("Expires", "0");
+  return res;
+}
 function fail(res, msg, code = 400) { return res.status(code).json({ ok: false, error: msg }); }
 
 // serialize video metadata for the public API
@@ -508,10 +516,12 @@ app.get("/api/user/referrals", auth, async (req, res) => {
 // ============================================================
 
 app.get("/api/premium/status", auth, async (req, res) => {
+  noStore(res);
   try { ok(res, await premium.status(req.userId)); } catch (e) { fail(res, e.message, 500); }
 });
 
 app.get("/api/premium/history", auth, async (req, res) => {
+  noStore(res);
   try {
     const h = await premium.history(req.userId);
     h.status = await premium.status(req.userId);
@@ -521,6 +531,7 @@ app.get("/api/premium/history", auth, async (req, res) => {
 
 // Spend referrals: {count: 1} → 2.5h, 2 → 5h, 4 → 10h
 app.post("/api/premium/redeem", auth, async (req, res) => {
+  noStore(res);
   try {
     const result = await premium.redeemReferrals(req.userId, req.body.count || 1);
     if (!result.ok) return fail(res, result.error, result.code || 400);

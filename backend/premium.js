@@ -96,14 +96,20 @@ async function referralSlots(uid) {
   return { total: mine.size, used: mine.size - available.length, available, myCode };
 }
 
+// Live premium state. `until` and `serverNow` are real UTC epoch seconds, and
+// everything is derived on every read: nothing is stored as a running counter,
+// so a closed window can never keep reporting time left. The client compares
+// serverNow with its own clock to fix drift and trusts `active` from here only.
 async function status(uid) {
-  const until = await premiumUntil(uid);
+  const until = Math.floor(await premiumUntil(uid));
   const now = Math.floor(Date.now() / 1000);
+  const active = until > now;
   const slots = await referralSlots(uid);
   return {
-    active: until > now,
-    until,
-    remainingSeconds: Math.max(0, until - now),
+    active,
+    until: active ? until : 0,
+    serverNow: now,
+    remainingSeconds: active ? (until - now) : 0,
     referrals: {
       total: slots.total,
       used: slots.used,
