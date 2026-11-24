@@ -556,8 +556,9 @@ app.get("/api/premium/status", auth, async (req, res) => {
 app.get("/api/premium/history", auth, async (req, res) => {
   noStore(res);
   try {
+    const status = await premium.status(req.userId);
     const h = await premium.history(req.userId);
-    h.status = await premium.status(req.userId);
+    h.status = status;
     ok(res, h);
   } catch (e) { fail(res, e.message, 500); }
 });
@@ -573,6 +574,7 @@ app.post("/api/premium/redeem", auth, async (req, res) => {
 });
 
 app.post("/api/admin/premium/grant", adminAuth, async (req, res) => {
+  noStore(res);
   try {
     const r = await premium.grant(req.body.uid, req.body.hours, req.body.source || "admin",
       req.body.amountPaise || 0, req.body.note || "");
@@ -582,6 +584,7 @@ app.post("/api/admin/premium/grant", adminAuth, async (req, res) => {
 });
 
 app.get("/api/admin/premium", adminAuth, async (req, res) => {
+  noStore(res);
   try {
     const uid = String(req.query.uid || "");
     if (!uid) return fail(res, "uid required");

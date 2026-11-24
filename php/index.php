@@ -959,8 +959,9 @@ if ($path === '/api/premium/status' && ($method === 'GET' || $method === 'POST')
 
 if ($path === '/api/premium/history' && ($method === 'GET' || $method === 'POST')) {
     $auth = require_auth();
+    $status = premium_status($auth['uid']);
     $history = premium_history($auth['uid']);
-    $history['status'] = premium_status($auth['uid']);
+    $history['status'] = $status;
     json_ok($history);
 }
 

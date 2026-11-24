@@ -184,15 +184,17 @@ function premium_referral_slots($uid) {
     ];
 }
 
-// Live premium state. `until` and `serverNow` are real UTC epoch seconds, and
-// everything is derived on every read: nothing is stored as a running counter,
-// so a closed window can never keep reporting time left. The client compares
-// serverNow with its own clock to fix drift and trusts `active` from here only.
-function premium_status($uid) {
-    $until = (int) premium_until((string) $uid);
+// Live status bypasses the ledger TTL. A caller that just refreshed the ledger
+// after a write may reuse that snapshot. The countdown uses the current clock.
+function premium_status($uid, $fresh = true) {
+    $until = (int) premium_until((string) $uid, $fresh);
+    if ($fresh && (string) $uid !== '' && function_exists('fc_set')) {
+        // Keep stream/list gating on this host in step with the live answer.
+        fc_set('prem_until_' . sha1((string) $uid), $until);
+    }
+    $slots = premium_referral_slots($uid);
     $now = time();
     $active = $until > $now;
-    $slots = premium_referral_slots($uid);
 
     return [
         'active' => $active,
@@ -333,7 +335,7 @@ function premium_redeem_referrals($uid, $count) {
     return [
         'ok' => true,
         'entry' => $entry,
-        'status' => premium_status($uid),
+        'status' => premium_status($uid, false),
     ];
 }
 
@@ -363,7 +365,7 @@ function premium_grant($uid, $hours, $source = 'admin', $amountPaise = 0, $note 
         'endsAt' => $end,
     ]);
 
-    return ['ok' => true, 'entry' => $entry, 'status' => premium_status($uid)];
+    return ['ok' => true, 'entry' => $entry, 'status' => premium_status($uid, false)];
 }
 
 // === Signed stream links ====================================================
