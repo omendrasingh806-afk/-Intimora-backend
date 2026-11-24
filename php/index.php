@@ -507,13 +507,12 @@ if (preg_match('#^/api/videos/([^/]+)$#', $path, $m) && $method === 'GET') {
     ignore_user_abort(true);
     @set_time_limit(25);
 
+    // The view is counted locally and folded into the Telegram message at most
+    // once every 20 s. Editing it here would make every play wait for a round
+    // trip; the list route is what refreshes the channel cache.
     try {
-        store_refresh_stale();
-    } catch (\Throwable $e) {
-        // a failed refresh must never break the response
-    }
-    try {
-        store_increment_views($videoId);
+        store_queue_view($videoId);
+        store_flush_views(1);
     } catch (\Throwable $e) {
         // a missed view count must never break the response
     }

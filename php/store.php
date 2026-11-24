@@ -99,15 +99,13 @@ function store_get_cache($type) {
         return null;
     }
 
-    $age = fc_get('store_ts_' . $type, 31536000);
-    if (!is_int($age)) {
-        // Cache written before the separate read stamp existed.
-        $age = fc_age('store_' . $type);
-    }
+    $stamp = fc_get('store_ts_' . $type, 31536000);
+    // Seconds since the last real channel read. A cache written before the
+    // separate read stamp existed falls back to the data file's mtime.
+    $age = is_int($stamp) ? max(0, time() - $stamp) : fc_age('store_' . $type);
     if ($age === null || $age >= STORE_DISK_STALE) {
         return null;
     }
-    $age = max(0, time() - $age);
 
     // Fresh or stale: read the cached copy once, no Telegram round trip.
     $fromDisk = fc_peek('store_' . $type);
@@ -836,6 +834,78 @@ function store_increment_views($videoId) {
         return null;
     }
     return store_update_video_stats($videoId, ['views' => (int) ($v['views'] ?? 0) + 1]);
+}
+
+// === View batching =========================================================
+// Counting a view with an immediate message edit costs a full Telegram round
+// trip, and that wait lands on the visitor opening the video. Views are counted
+// locally in one small cache file and folded into the metadata message at most
+// once every STORE_VIEW_FLUSH seconds, so many views cost one edit.
+if (!defined('STORE_VIEW_FLUSH')) {
+    define('STORE_VIEW_FLUSH', 20);
+}
+
+function store_views_map() {
+    $map = fc_get('views_pending', 604800);
+    return is_array($map) ? $map : [];
+}
+
+function store_views_map_set($map) {
+    fc_set('views_pending', $map);
+}
+
+// Count one view without touching Telegram. Returns nothing useful to the
+// caller: the response already carries the previous count.
+function store_queue_view($videoId) {
+    $id = (string) $videoId;
+    if ($id === '') {
+        return;
+    }
+    $map = store_views_map();
+    $map[$id] = (int) ($map[$id] ?? 0) + 1;
+    store_views_map_set($map);
+}
+
+// Fold queued views into the metadata messages. Throttled globally so a busy
+// video does not rewrite its message for every play.
+function store_flush_views($max = 2) {
+    $now = time();
+    $last = fc_get('views_flush_at', 604800);
+    if (is_int($last) && ($now - $last) < STORE_VIEW_FLUSH) {
+        return 0;
+    }
+
+    $map = store_views_map();
+    if (!$map) {
+        return 0;
+    }
+    fc_set('views_flush_at', $now);
+
+    $done = 0;
+    foreach ($map as $id => $count) {
+        if ($done >= $max) {
+            break;
+        }
+        $count = (int) $count;
+        if ($count <= 0) {
+            unset($map[$id]);
+            continue;
+        }
+        try {
+            $v = store_get_video((string) $id);
+            if (!$v) {
+                unset($map[$id]);
+                continue;
+            }
+            store_update_video_stats((string) $id, ['views' => (int) ($v['views'] ?? 0) + $count]);
+            unset($map[$id]);
+            $done++;
+        } catch (\Throwable $e) {
+            // stays queued; a later request retries
+        }
+    }
+    store_views_map_set($map);
+    return $done;
 }
 
 function store_toggle_video_like($videoId, $userId) {
