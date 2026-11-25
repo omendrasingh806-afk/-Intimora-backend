@@ -139,6 +139,9 @@ function publicVideo(v) {
     embedUrl: external ? (v.embedUrl || "") : "",
     streamUrl: external ? null : `/api/videos/${v.id}/stream`,
     thumbnailUrl: external ? (v.thumbnailUrl || "") : `/api/videos/${v.id}/thumbnail`,
+    // `type` reports whether the link handed out is the whole file or only the
+    // trailer; premium.shapeVideo sets the premium cases.
+    type: "full",
     // The file's BestFile copy, so a client can link the CDN file directly
     // instead of streaming the bytes through this server. A premium video gets
     // this blanked by premium.shapeVideo; a trailer is public, so its link stays.
@@ -146,6 +149,7 @@ function publicVideo(v) {
       download_id: (v.bestfile && v.bestfile.download_id) || "",
       download_link: (v.bestfile && v.bestfile.download_link) || "",
       size: (v.bestfile && Number(v.bestfile.size)) || 0,
+      type: "full",
     },
     trailerBestfile: (v.trailer && v.trailer.bestfile && v.trailer.bestfile.download_link) || "",
   };
@@ -259,7 +263,7 @@ app.get("/api/videos/:id", async (req, res) => {
       v = await store.incrementViews(req.params.id);
       if (!v) return fail(res, "Video not found", 404);
     }
-    ok(res, (await withDirectLinks([await premium.shapeVideo(publicVideo(v), v, await optionalUid(req))], { trailers: "all" }))[0]);
+    ok(res, (await withDirectLinks([await premium.shapeVideo(publicVideo(v), v, await optionalUid(req), { detail: true })], { trailers: "all" }))[0]);
   } catch (e) { fail(res, e.message, 500); }
 });
 

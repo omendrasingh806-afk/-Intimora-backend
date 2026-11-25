@@ -455,6 +455,22 @@ function public_with_direct_links(array $pub, $resolved = null) {
         $pub['trailerBestfile'] = $trailerUrl;
     }
 
+    // `type` says what the caller actually got: the whole file or only the
+    // trailer. premium_shape_video already decided it from the account; this is
+    // the fallback for a video that never went through that gate.
+    if (!isset($pub['type']) || !in_array($pub['type'], ['full', 'trailer'], true)) {
+        if ((string) ($pub['bestfile']['download_link'] ?? '') !== '') {
+            $pub['type'] = 'full';
+        } elseif ((string) ($pub['trailerBestfile'] ?? '') !== '') {
+            $pub['type'] = 'trailer';
+        } else {
+            $pub['type'] = 'none';
+        }
+    }
+    if (!isset($pub['bestfile']['type'])) {
+        $pub['bestfile']['type'] = $pub['type'] === 'full' && (string) ($pub['bestfile']['download_link'] ?? '') !== '' ? 'full' : '';
+    }
+
     return $pub;
 }
 
@@ -547,7 +563,7 @@ if (preg_match('#^/api/videos/([^/]+)$#', $path, $m) && $method === 'GET') {
     // has no reason to wait for it.
     header('Content-Type: application/json');
     header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
-    echo json_encode(['ok' => true, 'data' => public_with_direct_links(premium_shape_video(store_public_video($video), $video, premium_uid_optional()))]);
+    echo json_encode(['ok' => true, 'data' => public_with_direct_links(premium_shape_video(store_public_video($video), $video, premium_uid_optional(), true))]);
 
     if (function_exists('fastcgi_finish_request')) {
         fastcgi_finish_request();

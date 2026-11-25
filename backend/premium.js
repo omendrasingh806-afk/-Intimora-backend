@@ -243,7 +243,13 @@ function hasTrailer(v) {
   return !!(t && ((t.docId || t.tg_doc_id) || (t.bestfile && t.bestfile.download_link)));
 }
 
-async function shapeVideo(pub, video, uid) {
+// `type` tells the frontend what the `bestfile` link in this answer is: "full"
+// (the whole file) or "trailer" (only the trailer copy), decided here from the
+// account's premium status instead of leaving the client to guess.
+//
+// opts.detail marks a single-video request: there a paying account gets the full
+// file alone and no trailer link at all.
+async function shapeVideo(pub, video, uid, { detail = false } = {}) {
   const premium = isPremiumVideo(video);
   const trailer = hasTrailer(video);
   const id = String(video.id || "");
@@ -251,6 +257,8 @@ async function shapeVideo(pub, video, uid) {
   pub.locked = false;
   pub.premium = premium;
   pub.hasTrailer = trailer;
+  pub.type = "full";
+  if (pub.bestfile) pub.bestfile.type = "full";
 
   if (!premium) {
     // Public on purpose: a trailer needs no login and no token.
@@ -266,19 +274,28 @@ async function shapeVideo(pub, video, uid) {
     // stream URL and as the BestFile link (withDirectLinks turns the page link
     // into a fresh direct URL).
     pub.streamUrl = `/api/videos/${encodeURIComponent(id)}/stream?t=${token(uid, id, "video", until)}`;
+    pub.type = "full";
+    if (pub.bestfile) pub.bestfile.type = "full";
   } else {
     // Never hand out a permanent BestFile link for premium content: a locked
-    // account only ever sees the trailer.
-    pub.bestfile = { download_id: "", download_link: "", size: (video.bestfile && video.bestfile.size) || 0, };
+    // account only ever sees the trailer, so that is what `type` reports.
+    pub.bestfile = { download_id: "", download_link: "", size: (video.bestfile && video.bestfile.size) || 0, type: "" };
     pub.locked = true;
+    pub.type = trailer ? "trailer" : "none";
     delete pub.streamUrl;
   }
 
-  if (trailer) {
+  if (trailer && !(active && detail)) {
     // Public on purpose: the trailer plays even when the account is locked.
     pub.trailerUrl = `/api/videos/${encodeURIComponent(id)}/stream?kind=trailer`;
   } else {
     delete pub.trailerUrl;
+  }
+
+  if (active && detail) {
+    // A single-video request from a paying account carries the full file alone.
+    delete pub.trailerBestfile;
+    delete pub.trailerPageUrl;
   }
 
   return pub;

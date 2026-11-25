@@ -435,13 +435,26 @@ function premium_has_trailer($video) {
 //  - premium + active user: stream token, no permanent BestFile link
 //  - premium + inactive + trailer: only the trailer link
 //  - premium + inactive + no trailer: no stream at all
-function premium_shape_video($pub, $video, $uid) {
+//
+// `type` tells the frontend what the `bestfile` link in this answer is:
+// "full" (the whole file) or "trailer" (only the trailer copy). It is decided
+// here, from the account's premium status, instead of leaving the client to
+// guess from `premium` + `locked`.
+//
+// $detail marks a single-video request: there a paying account gets the full
+// file alone and no trailer link at all.
+function premium_shape_video($pub, $video, $uid, $detail = false) {
     $isPremium = premium_video_flag($video);
     $hasTrailer = premium_has_trailer($video);
+    $active = false;
 
     $pub['locked'] = false;
     $pub['premium'] = $isPremium;
     $pub['hasTrailer'] = $hasTrailer;
+    $pub['type'] = 'full';
+    if (isset($pub['bestfile']) && is_array($pub['bestfile'])) {
+        $pub['bestfile']['type'] = 'full';
+    }
 
     // A third-party video is played by its own source: there is no stream of
     // ours to gate and nothing to unlock.
@@ -465,23 +478,35 @@ function premium_shape_video($pub, $video, $uid) {
         // signed stream URL and as the BestFile link (public_with_direct_links
         // turns the page link into a fresh direct URL).
         $pub['streamUrl'] = '/api/videos/' . rawurlencode($id) . '/stream?t=' . premium_token($uid, $id, 'video');
+        $pub['type'] = 'full';
+        if (isset($pub['bestfile']) && is_array($pub['bestfile'])) {
+            $pub['bestfile']['type'] = 'full';
+        }
     } else {
         // Never expose a permanent BestFile link for premium content: a locked
-        // account only ever sees the trailer.
+        // account only ever sees the trailer, so that is what `type` reports.
         $pub['bestfile'] = [
             'download_id' => '',
             'download_link' => '',
             'size' => (int) ($video['bestfile']['size'] ?? 0),
+            'type' => '',
         ];
         $pub['locked'] = true;
+        $pub['type'] = $hasTrailer ? 'trailer' : 'none';
         unset($pub['streamUrl']);
     }
 
-    if ($hasTrailer) {
+    if ($hasTrailer && !($active && $detail)) {
         // Public on purpose: the trailer plays even when the account is locked.
         $pub['trailerUrl'] = '/api/videos/' . rawurlencode($id) . '/stream?kind=trailer';
     } else {
         unset($pub['trailerUrl']);
+    }
+
+    if ($active && $detail) {
+        // A single-video request from a paying account carries the full file
+        // alone: no trailer link that could be mistaken for the video.
+        unset($pub['trailerBestfile'], $pub['trailerPageUrl']);
     }
 
     return $pub;

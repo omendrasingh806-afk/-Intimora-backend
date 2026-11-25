@@ -261,10 +261,14 @@ function store_public_video($v) {
         'source' => $external ? (string) ($v['source'] ?? '') : '',
         'pageUrl' => $external ? (string) ($v['pageUrl'] ?? '') : '',
         'embedUrl' => $external ? (string) ($v['embedUrl'] ?? '') : '',
+        // `type` reports whether the link handed out is the whole file or only
+        // the trailer; premium_shape_video / public_with_direct_links set it.
+        'type' => 'full',
         'bestfile' => [
             'download_id' => $v['bestfile']['download_id'] ?? '',
             'download_link' => $v['bestfile']['download_link'] ?? '',
             'size' => (int) ($v['bestfile']['size'] ?? 0),
+            'type' => 'full',
         ],
         // A trailer is public even when the video is premium, so its BestFile
         // link is handed out with the rest of the public JSON.
