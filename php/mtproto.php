@@ -46,7 +46,14 @@ function mtproto_session_path() {
     if (!is_dir($dir)) {
         @mkdir($dir, 0777, true);
     }
-    return $dir . '/telegram.madeline';
+    // One session file per auth key. Both PHP accounts used to share
+    // sessions/telegram.madeline, so a host kept reusing the key it had already
+    // imported even after TELEGRAM_SESSION changed — and two hosts on one key is
+    // exactly what Telegram rejects as "concurrent usage". Keying the file by the
+    // current string means a new string always starts a clean import and a stale
+    // file can never be picked up by mistake.
+    $tag = substr(sha1((string) TELEGRAM_SESSION), 0, 10);
+    return $dir . '/telegram-' . $tag . '.madeline';
 }
 
 /**
