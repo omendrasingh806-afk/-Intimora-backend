@@ -16,12 +16,6 @@ const BF_UA =
 
 // Every network call is bounded: a serverless request must never hang on BestFile.
 const REQ_TIMEOUT_MS = 8000;
-// A resolved link is reused for a few minutes: the signed URL itself lives an
-// hour, so a page of videos is not re-resolved on every load. The stream route
-// asks BestFile again for each play.
-const CDN_TTL_MS = 5 * 60 * 1000;
-
-const cdnCache = new Map(); // pageId -> { url, exp }
 
 function cookieHeader(jar) {
   return Object.entries(jar).map(([k, v]) => k + "=" + v).join("; ");
@@ -88,7 +82,11 @@ async function bfResolveFinalUrl(link, jar, maxHops = 6) {
     const r = await rawRequest(url, { method: "GET", headers });
     const loc = r.headers && r.headers.location ? String(r.headers.location) : "";
     if (r.status >= 300 && r.status < 400 && loc) {
-      url = new URL(loc, url).toString();
+      const next = new URL(loc, url).toString();
+      // A location on the storage host is already the signed direct link; no
+      // point downloading a byte of it just to learn the address.
+      if (!next.includes(BF_HOST)) return next;
+      url = next;
       continue;
     }
     if (r.status === 200 || r.status === 206) return url;
@@ -158,9 +156,6 @@ async function bfGetCdnUrlInner(downloadLink, fresh = false) {
     if (!m) return null;
     const pageId = m[1];
 
-    const cached = cdnCache.get(pageId);
-    if (!fresh && cached && cached.exp > Date.now()) return cached.url;
-
     const session = await bfPageSession(pageId);
     if (!session) return null;
 
@@ -174,11 +169,7 @@ async function bfGetCdnUrlInner(downloadLink, fresh = false) {
       session.jar = retry.jar;
     }
 
-    const finalUrl = await bfResolveFinalUrl(link, session.jar);
-    if (!finalUrl) return null;
-
-    cdnCache.set(pageId, { url: finalUrl, exp: Date.now() + CDN_TTL_MS });
-    return finalUrl;
+    return await bfResolveFinalUrl(link, session.jar);
   } catch (e) {
     console.error("bfGetCdnUrl error:", e.message);
     return null;

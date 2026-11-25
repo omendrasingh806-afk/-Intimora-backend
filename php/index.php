@@ -458,14 +458,14 @@ function public_with_direct_links(array $pub, $resolved = null) {
     return $pub;
 }
 
-// Resolve every BestFile page link of a list in one batch.
+// Resolve the BestFile page link of every video in a list. Trailers keep their
+// page link here: asking for one fresh direct link per card already costs the
+// host a couple of seconds per item.
 function public_list_with_direct_links(array $videos) {
     $links = [];
     foreach ($videos as $v) {
         $link = (string) ($v['bestfile']['download_link'] ?? '');
         if ($link !== '') $links[] = $link;
-        $trailer = (string) ($v['trailerBestfile'] ?? '');
-        if ($trailer !== '') $links[] = $trailer;
     }
     $resolved = $links ? bestfile_get_cdn_urls($links) : [];
     return array_map(function ($v) use ($resolved) {
