@@ -5,6 +5,7 @@
   "main": "backend/server.js",
   "scripts": {
     "start": "node backend/server.js",
+    "start:persistent": "node backend/persistent.js",
     "dev": "node --watch backend/server.js",
     "login": "node scripts/login.js"
   },

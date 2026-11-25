@@ -79,6 +79,77 @@ async function getClient() {
   }
 }
 
+// ================= PERSISTENT RUNTIME (one socket, kept warm) =================
+// A long-running host (Botkeep, a VPS, a worker dyno) pays for the MTProto
+// handshake exactly once and reuses that socket for every request. Serverless
+// hosts (Vercel/Netlify) must never start this: their process is torn down
+// between invocations, so a timer would either be lost or pin the invocation.
+// Nothing here changes getClient() — it stays lazy, which is what makes the
+// serverless path keep working untouched.
+let _keepAlive = null;
+let _tickBusy = false;
+
+function clientConnected() {
+  return !!(_client && typeof _client.isConnected === "function" && _client.isConnected());
+}
+
+// One cheap RPC proves the socket is still usable. isConnected() alone keeps
+// answering "true" on a socket Telegram has already dropped, which surfaced as a
+// hung request instead of a reconnect.
+async function ping() {
+  const client = await getClient();
+  await client.getMe();
+  return true;
+}
+
+async function dropClient() {
+  const dead = _client;
+  _client = null;
+  if (!dead) return;
+  try { await dead.disconnect(); } catch { /* socket already gone */ }
+}
+
+// Keep the session alive and self-heal: a failed ping drops the socket, so the
+// next tick (or the next request) reconnects from TELEGRAM_SESSION. The saved
+// session string means this never needs a new login code.
+function startKeepAlive(intervalMs = 60000) {
+  if (_keepAlive) return _keepAlive;
+  const tick = async () => {
+    if (_tickBusy) return;
+    _tickBusy = true;
+    try {
+      await ping();
+    } catch (e) {
+      console.error("[mtproto] keepalive failed, reconnecting:", e && e.message);
+      await dropClient();
+    } finally {
+      _tickBusy = false;
+    }
+  };
+  _keepAlive = setInterval(tick, Math.max(15000, intervalMs));
+  if (typeof _keepAlive.unref === "function") _keepAlive.unref();
+  tick(); // connect now, not after the first interval
+  return _keepAlive;
+}
+
+function stopKeepAlive() {
+  if (!_keepAlive) return;
+  clearInterval(_keepAlive);
+  _keepAlive = null;
+}
+
+// Boot helper for a persistent host: connect once, then keep it warm.
+async function warmUp() {
+  await getClient();
+  startKeepAlive(Number(process.env.MTPROTO_KEEPALIVE_MS) || 60000);
+}
+
+// Shutdown helper: stop the keepalive before closing the socket.
+async function shutdown() {
+  stopKeepAlive();
+  await dropClient();
+}
+
 // ================= LOGIN (web, two-step, no 2FA) =================
 async function sendLoginCode(phoneNumber) {
   const { apiId, apiHash } = cfg();
@@ -712,6 +783,12 @@ module.exports = {
   channelPremium,
   channelAccounts,
   getClient,
+  clientConnected,
+  ping,
+  warmUp,
+  startKeepAlive,
+  stopKeepAlive,
+  shutdown,
   sendLoginCode,
   verifyLogin,
   uploadVideo,
