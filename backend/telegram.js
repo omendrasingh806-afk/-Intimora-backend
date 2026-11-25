@@ -785,6 +785,7 @@ module.exports = {
   getClient,
   clientConnected,
   ping,
+  dropClient,
   warmUp,
   startKeepAlive,
   stopKeepAlive,
