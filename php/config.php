@@ -10,7 +10,25 @@ if (defined('TG_API_ID')) {
 // === Telegram MTProto ===
 define('TG_API_ID', '37144075');
 define('TG_API_HASH', '57a11adf8679a2e7a2b6184ed7bb9c70');
-define('TELEGRAM_SESSION', '1BQANOTEuMTA4LjU2LjExNwG7xI2giu7fxyG7MsovMdZ20Gtnox2LmhxA8ZmmOtQKw7imL0mBZ4e2bG7Dd3a0s3bqWYVqLzizh7e2kWCFaV8pT5HPR5wEOuPNfxLLCL3Gjsiw/qNRV8DiPMmXWEGMoncujjEz0isNOucrrJdk9ZUyB0EFGHiX4xCyiAs9WfjJ5U8zigz847ET50CsEQS2EmVOYxhkvyyWN9st8uEQ42awadLj6RgDyetXpXuZi/ajSro1ROxAmQriNx+N42e6xhy+dvHFcAPv4BSFGgA3UP3UMTwOR7ZNYNIFX6gUpqmgnnWfcPF0Y3vCLAdcYRPArrsVjCzSprDsGCBVHyTI+Wl97w==');
+// === Telegram session — PER HOST ===
+// Both InfinityFree accounts (intimora-api2 / intimora-api3) run this same code
+// and this same Telegram user, but each host needs its OWN session string: two
+// hosts sharing one auth key collide with Telegram's "concurrent usage" error
+// and streams start failing. So the session lives in a one-line file next to
+// this one, uploaded per host and never committed:
+//
+//   php/session.local.php
+//   <?php define('TELEGRAM_SESSION', '1BQANOTEu...');
+//
+// Without that file the constant comes from the TELEGRAM_SESSION env var.
+$__sessionFile = __DIR__ . '/session.local.php';
+if (is_file($__sessionFile)) {
+    require $__sessionFile;
+}
+unset($__sessionFile);
+if (!defined('TELEGRAM_SESSION')) {
+    define('TELEGRAM_SESSION', (string) getenv('TELEGRAM_SESSION'));
+}
 
 // === Telegram Channels ===
 define('TG_CHANNEL_VIDEO', '-1003756299546');
@@ -45,7 +63,10 @@ define('FIREBASE_AUTH_DOMAIN', 'intimora-app.firebaseapp.com');
 define('ADMIN_API_KEY', 'Prashant');
 
 // === Site ===
-define('SITE_URL', 'https://intimora-api2.site.je');
+// Per host: session.local.php may override this (api3 defines its own).
+if (!defined('SITE_URL')) {
+    define('SITE_URL', 'https://intimora-api2.site.je');
+}
 
 // === Cache ===
 // NO mkdir() — InfinityFree only allows directory creation in htdocs
