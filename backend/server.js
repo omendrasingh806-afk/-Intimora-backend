@@ -155,14 +155,18 @@ function publicVideo(v) {
 // the file's page, and the signed CDN URL behind it expires. It is resolved
 // again for each response (never from an earlier answer) and keeps the page
 // link as `page_url` when BestFile does not answer.
-async function withDirectLinks(videos) {
+async function withDirectLinks(videos, { trailers = "premium" } = {}) {
   return Promise.all((videos || []).map(async (v) => {
     if (!v || typeof v !== "object") return v;
     const page = v.bestfile && v.bestfile.download_link;
     const trailerPage = v.trailerBestfile;
+    // A full-page list only resolves the trailers of premium videos: those are
+    // the ones whose full link is withheld, so the trailer is what a caller can
+    // actually use. A single video resolves both.
+    const wantsTrailer = !!trailerPage && (trailers === "all" || v.premium === true);
     const [direct, trailerDirect] = await Promise.all([
       page ? bestfile.bfGetCdnUrl(page) : null,
-      trailerPage ? bestfile.bfGetCdnUrl(trailerPage) : null,
+      wantsTrailer ? bestfile.bfGetCdnUrl(trailerPage) : null,
     ]);
     if (direct && v.bestfile) {
       v.bestfile.page_url = page;
@@ -255,7 +259,7 @@ app.get("/api/videos/:id", async (req, res) => {
       v = await store.incrementViews(req.params.id);
       if (!v) return fail(res, "Video not found", 404);
     }
-    ok(res, (await withDirectLinks([await premium.shapeVideo(publicVideo(v), v, await optionalUid(req))]))[0]);
+    ok(res, (await withDirectLinks([await premium.shapeVideo(publicVideo(v), v, await optionalUid(req))], { trailers: "all" }))[0]);
   } catch (e) { fail(res, e.message, 500); }
 });
 

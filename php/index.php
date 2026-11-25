@@ -466,6 +466,12 @@ function public_list_with_direct_links(array $videos) {
     foreach ($videos as $v) {
         $link = (string) ($v['bestfile']['download_link'] ?? '');
         if ($link !== '') $links[] = $link;
+        // A locked premium video withholds the full link, so its trailer's direct
+        // link is the one the caller can actually use.
+        if (!empty($v['premium'])) {
+            $trailer = (string) ($v['trailerBestfile'] ?? '');
+            if ($trailer !== '') $links[] = $trailer;
+        }
     }
     $resolved = $links ? bestfile_get_cdn_urls($links) : [];
     return array_map(function ($v) use ($resolved) {

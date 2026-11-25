@@ -261,12 +261,15 @@ async function shapeVideo(pub, video, uid) {
   const active = uid ? await isActive(uid) : false;
   const until = active ? await premiumUntil(uid) : 0;
 
-  // Never hand out a permanent BestFile link for premium content.
-  pub.bestfile = { download_id: "", download_link: "", size: (video.bestfile && video.bestfile.size) || 0, };
-
   if (active) {
+    // The account is paying right now: it gets the full file, both as a signed
+    // stream URL and as the BestFile link (withDirectLinks turns the page link
+    // into a fresh direct URL).
     pub.streamUrl = `/api/videos/${encodeURIComponent(id)}/stream?t=${token(uid, id, "video", until)}`;
   } else {
+    // Never hand out a permanent BestFile link for premium content: a locked
+    // account only ever sees the trailer.
+    pub.bestfile = { download_id: "", download_link: "", size: (video.bestfile && video.bestfile.size) || 0, };
     pub.locked = true;
     delete pub.streamUrl;
   }

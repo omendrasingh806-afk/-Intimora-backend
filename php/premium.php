@@ -460,16 +460,19 @@ function premium_shape_video($pub, $video, $uid) {
     $active = $uid !== '' && premium_is_active($uid);
     $id = (string) ($video['id'] ?? '');
 
-    // Never expose a permanent BestFile link for premium content.
-    $pub['bestfile'] = [
-        'download_id' => '',
-        'download_link' => '',
-        'size' => (int) ($video['bestfile']['size'] ?? 0),
-    ];
-
     if ($active) {
+        // The account is paying right now: it gets the full file, both as a
+        // signed stream URL and as the BestFile link (public_with_direct_links
+        // turns the page link into a fresh direct URL).
         $pub['streamUrl'] = '/api/videos/' . rawurlencode($id) . '/stream?t=' . premium_token($uid, $id, 'video');
     } else {
+        // Never expose a permanent BestFile link for premium content: a locked
+        // account only ever sees the trailer.
+        $pub['bestfile'] = [
+            'download_id' => '',
+            'download_link' => '',
+            'size' => (int) ($video['bestfile']['size'] ?? 0),
+        ];
         $pub['locked'] = true;
         unset($pub['streamUrl']);
     }
