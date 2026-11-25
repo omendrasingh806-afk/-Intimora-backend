@@ -49,7 +49,11 @@ async function auth(req, res, next) {
 }
 
 // Optional auth: a valid Firebase token gives the uid, no token gives "".
+// A signed viewer token is accepted too: that is how a plain video GET carries
+// the account on a host where an Authorization header would need a preflight.
 async function optionalUid(req) {
+  const viewer = premium.checkViewerToken(req.query.viewer);
+  if (viewer) return viewer;
   const header = req.headers.authorization || "";
   if (!header.startsWith("Bearer ")) return "";
   try {
@@ -585,6 +589,13 @@ app.get("/api/user/referrals", auth, async (req, res) => {
 // PREMIUM ROUTES (referral based)
 // ============================================================
 
+// Exchange the Firebase token for the short-lived signed viewer token used by
+// the plain video reads (see premium.viewerToken).
+app.post("/api/premium/viewer", auth, (req, res) => {
+  noStore(res);
+  ok(res, premium.viewerToken(req.userId));
+});
+
 app.get("/api/premium/status", auth, async (req, res) => {
   noStore(res);
   try { ok(res, await premium.status(req.userId)); } catch (e) { fail(res, e.message, 500); }
@@ -626,6 +637,42 @@ app.get("/api/admin/premium", adminAuth, async (req, res) => {
     const uid = String(req.query.uid || "");
     if (!uid) return fail(res, "uid required");
     ok(res, { status: await premium.status(uid), history: await premium.history(uid) });
+  } catch (e) { fail(res, e.message, 500); }
+});
+
+// Admin: every registered account with the premium time it still has. The
+// answer carries the server clock and an absolute end time, so the panel can
+// tick a live countdown without trusting the admin's own clock.
+app.get("/api/admin/users", adminAuth, async (req, res) => {
+  noStore(res);
+  try {
+    const all = await users.readUsers();
+    const now = Math.floor(Date.now() / 1000);
+    const q = String(req.query.q || "").trim().toLowerCase();
+    const limit = Math.min(parseInt(req.query.limit, 10) || 1000, 5000);
+    const out = [];
+    for (const u of all) {
+      const uid = String(u.uid || u.id || "");
+      if (!uid) continue;
+      const hay = `${u.name || ""} ${u.username || ""} ${u.email || ""} ${uid}`.toLowerCase();
+      if (q && !hay.includes(q)) continue;
+      const until = Math.floor(await premium.premiumUntil(uid));
+      out.push({
+        uid,
+        name: u.name || "",
+        username: u.username || "",
+        email: u.email || "",
+        referralCode: u.referralCode || u.referral_code || "",
+        referredBy: u.referredBy || u.referred_by || "",
+        createdAt: Number(u.createdAt || u.at || 0) || 0,
+        premiumUntil: until,
+        premiumActive: until > now,
+        remainingSeconds: until > now ? until - now : 0,
+      });
+      if (out.length >= limit) break;
+    }
+    out.sort((a, b) => (b.premiumActive - a.premiumActive) || (b.premiumUntil - a.premiumUntil));
+    ok(res, { users: out, serverNow: now, total: all.length });
   } catch (e) { fail(res, e.message, 500); }
 });
 

@@ -233,6 +233,33 @@ function checkToken(value, videoId, kind) {
   return payload;
 }
 
+// ---- viewer identity for plain video reads ----
+// The catalogue and detail routes are GETs, and a PHP host refuses the CORS
+// preflight an Authorization header would need. The browser therefore exchanges
+// its Firebase token once for this short-lived, uid-bearing signature. It only
+// lets the answer be shaped for that account; the stream route still asks the
+// ledger on every request.
+function viewerToken(uid, ttlSeconds = 7200) {
+  const ttl = Math.max(60, Math.floor(Number(ttlSeconds) || 7200));
+  const until = Math.floor(Date.now() / 1000) + ttl;
+  const body = Buffer.from(JSON.stringify({ u: String(uid || ""), e: until })).toString("base64url");
+  const sig = crypto.createHmac("sha256", SECRET).update(body).digest("hex");
+  return { viewer: `${body}.${sig}`, until };
+}
+
+function checkViewerToken(value) {
+  if (!value || typeof value !== "string" || value.length > 4096 || !value.includes(".")) return "";
+  const [body, sig] = value.split(".");
+  const expect = crypto.createHmac("sha256", SECRET).update(body).digest("hex");
+  const a = Buffer.from(String(sig || ""));
+  const b = Buffer.from(expect);
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return "";
+  let payload;
+  try { payload = JSON.parse(Buffer.from(body, "base64url").toString("utf8")); } catch { return ""; }
+  if (!payload || Number(payload.e) < Math.floor(Date.now() / 1000)) return "";
+  return String(payload.u || "");
+}
+
 // ---- video shaping ----
 function isPremiumVideo(v) {
   return v && (v.premium === true || v.premium === "true");
@@ -312,6 +339,8 @@ module.exports = {
   grant,
   token,
   checkToken,
+  viewerToken,
+  checkViewerToken,
   isPremiumVideo,
   hasTrailer,
   shapeVideo,

@@ -29,6 +29,24 @@
         .progress-fill { height: 100%; background: #4f9eff; width: 0%; transition: width 0.3s; }
         .config { font-size: 12px; color: #666; background: #111; padding: 10px; border-radius: 6px; margin-bottom: 10px; }
         .config code { color: #4f9eff; }
+        .user-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 10px; }
+        .user-toolbar input[type="search"] { flex: 1 1 220px; margin: 0; }
+        .user-toolbar .btn-primary { padding: 10px 16px; }
+        .user-live { display: inline-flex; align-items: center; gap: 6px; margin: 0; font-size: 12px; color: #888; white-space: nowrap; }
+        .user-live input { width: auto; margin: 0; }
+        .users-status { font-size: 12px; color: #888; margin-bottom: 10px; }
+        .user-list { display: flex; flex-direction: column; gap: 8px; }
+        .user-row { display: grid; grid-template-columns: minmax(0, 1.6fr) auto auto auto; align-items: center; gap: 10px; padding: 10px 12px; border: 1px solid #2a2a40; border-radius: 10px; background: #12121f; }
+        .user-row__who { display: flex; min-width: 0; flex-direction: column; gap: 2px; }
+        .user-row__who strong { font-size: 14px; color: #e0e0e0; overflow-wrap: anywhere; }
+        .user-row__who span { font-size: 11px; color: #7d7d92; overflow-wrap: anywhere; }
+        .user-row__badge { padding: 2px 8px; border-radius: 999px; background: #26263a; color: #8b8ba3; font-size: 10px; font-weight: 700; letter-spacing: 0.06em; }
+        .user-row__badge.is-active { background: #3a2a10; color: #f0c05a; }
+        .user-row__left { font-size: 13px; font-variant-numeric: tabular-nums; color: #c9c9d6; white-space: nowrap; }
+        .user-row__left.is-expired { color: #7d7d92; }
+        .user-row__actions { display: flex; gap: 6px; }
+        .user-row__actions button { padding: 6px 10px; font-size: 12px; }
+        @media (max-width: 560px) { .user-row { grid-template-columns: minmax(0, 1fr) auto; } .user-row__actions { grid-column: 1 / -1; } }
     </style>
 </head>
 <body>
@@ -102,6 +120,18 @@
         <h2>📋 Videos</h2>
         <button class="btn-primary" onclick="loadVideos()">Refresh</button>
         <div id="video-list"></div>
+    </div>
+
+    <!-- Users & premium -->
+    <div class="card" id="users-section">
+        <h2>👥 Users &amp; premium</h2>
+        <div class="user-toolbar">
+            <input type="search" id="user-search" placeholder="Search name, username, email or uid">
+            <button class="btn-primary" id="users-refresh">Refresh</button>
+            <label class="user-live"><input type="checkbox" id="user-live" checked> Live</label>
+        </div>
+        <p id="users-status" class="users-status">Save your admin key in Configuration, then press Refresh.</p>
+        <div id="user-list" class="user-list"></div>
     </div>
 </div>
 
@@ -403,12 +433,135 @@ async function deleteVideo(id) {
     }
 }
 
+// ===== Users & premium =====
+// Every row carries the ledger's absolute end time; the countdown is drawn
+// against the server clock, so it is real premium time and not a local guess.
+let usersData = null;
+let usersSkewMs = 0;
+let usersTimer = null;
+
+function escapeHtml(value) {
+    return String(value == null ? '' : value).replace(/[&<>"']/g, (ch) => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+    }[ch]));
+}
+
+function formatLeft(totalSeconds) {
+    const seconds = Math.max(0, Math.floor(totalSeconds));
+    const hours = Math.floor(seconds / 3600);
+    const minutes = Math.floor((seconds % 3600) / 60);
+    const rest = seconds % 60;
+    const mm = String(minutes).padStart(2, '0');
+    const ss = String(rest).padStart(2, '0');
+    return hours > 0 ? `${hours}h ${mm}m ${ss}s` : `${minutes}m ${ss}s`;
+}
+
+function tickUsers() {
+    const now = Math.floor((Date.now() + usersSkewMs) / 1000);
+    document.querySelectorAll('.user-row__left').forEach((el) => {
+        const until = Number(el.dataset.until) || 0;
+        if (!until) { el.textContent = '—'; el.classList.remove('is-expired'); return; }
+        const left = until - now;
+        el.textContent = left > 0 ? formatLeft(left) : 'expired';
+        el.classList.toggle('is-expired', left <= 0);
+    });
+}
+
+function renderUsers() {
+    const list = document.getElementById('user-list');
+    if (!usersData || !list) return;
+    const query = document.getElementById('user-search').value.trim().toLowerCase();
+    const rows = usersData.users.filter((u) => !query
+        || `${u.name} ${u.username} ${u.email} ${u.uid}`.toLowerCase().includes(query));
+    if (!rows.length) {
+        list.innerHTML = '<p class="users-status">No account matches this search.</p>';
+        return;
+    }
+    list.innerHTML = rows.map((u) => `
+        <div class="user-row">
+            <div class="user-row__who">
+                <strong>${escapeHtml(u.name || u.username || 'Unnamed')}</strong>
+                <span>@${escapeHtml(u.username || 'unknown')}${u.email ? ` · ${escapeHtml(u.email)}` : ''}</span>
+            </div>
+            <div class="user-row__badge ${u.premiumActive ? 'is-active' : ''}">${u.premiumActive ? 'Premium' : 'Free'}</div>
+            <div class="user-row__left" data-until="${Number(u.premiumUntil) || 0}">${u.premiumActive ? formatLeft(Number(u.remainingSeconds) || 0) : '—'}</div>
+            <div class="user-row__actions">
+                <button class="btn-success" data-grant="2.5" data-uid="${escapeHtml(u.uid)}">+2.5h</button>
+                <button class="btn-primary" data-grant="5" data-uid="${escapeHtml(u.uid)}">+5h</button>
+            </div>
+        </div>`).join('');
+    tickUsers();
+}
+
+async function loadUsers() {
+    const status = document.getElementById('users-status');
+    if (!ADMIN_KEY) {
+        status.textContent = '⚠️ Save your admin key in Configuration first.';
+        return;
+    }
+    try {
+        const res = await fetch('/api/admin/users', {
+            headers: { 'X-API-Key': ADMIN_KEY },
+            cache: 'no-store',
+        });
+        const result = await res.json();
+        if (!result.ok) throw new Error(result.error || 'Request failed');
+        usersData = result.data;
+        usersSkewMs = (Number(result.data.serverNow) || Math.floor(Date.now() / 1000)) * 1000 - Date.now();
+        status.textContent = `${result.data.total} account(s) · updated ${new Date().toLocaleTimeString()}`;
+        renderUsers();
+    } catch (e) {
+        status.textContent = '❌ Could not load users: ' + e.message;
+    }
+}
+
+async function grantPremium(uid, hours) {
+    if (!ADMIN_KEY) return showStatus('⚠️ Save your admin key first', 'error');
+    if (!confirm(`Grant ${hours}h premium to ${uid}?`)) return;
+    try {
+        const res = await fetch('/api/admin/premium/grant', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-API-Key': ADMIN_KEY },
+            body: JSON.stringify({ uid, hours, source: 'admin' }),
+        });
+        const result = await res.json();
+        if (!result.ok) throw new Error(result.error || 'Failed');
+        showStatus(`✅ ${hours}h premium granted to ${uid}`, 'success');
+        loadUsers();
+    } catch (e) {
+        showStatus('❌ Grant failed: ' + e.message, 'error');
+    }
+}
+
+function startUsersLive() {
+    if (usersTimer) clearInterval(usersTimer);
+    usersTimer = null;
+    if (!document.getElementById('user-live').checked) return;
+    usersTimer = setInterval(() => { loadUsers(); }, 15_000);
+}
+
+document.getElementById('users-refresh').addEventListener('click', loadUsers);
+// Module scope functions are not globals, so the input is wired here instead of
+// through an inline handler.
+document.getElementById('user-search').addEventListener('input', renderUsers);
+document.getElementById('user-live').addEventListener('change', startUsersLive);
+document.getElementById('user-list').addEventListener('click', (event) => {
+    const button = event.target.closest('button[data-grant]');
+    if (!button) return;
+    grantPremium(button.dataset.uid, Number(button.dataset.grant));
+});
+setInterval(tickUsers, 1000);
+
 // ===== Init =====
 if (API_ID && API_ID !== 0) {
     initClient();
     showStatus('Config loaded from localStorage. Click "Save Config" to update.', 'info');
 } else {
     showStatus('⚠️ Edit config above and click "Save Config" to initialize.', 'info');
+}
+if (ADMIN_KEY) {
+    loadUsers();
+    startUsersLive();
 }
 </script>
 </body>

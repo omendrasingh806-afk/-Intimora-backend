@@ -1045,6 +1045,14 @@ if ($path === '/api/premium/redeem' && $method === 'POST') {
     json_ok(['status' => $result['status'], 'entry' => $result['entry']]);
 }
 
+// Exchange the Firebase token for a short-lived signed viewer token. The video
+// reads accept it as `?viewer=`, which avoids the CORS preflight this host's
+// browser check would answer with HTML.
+if ($path === '/api/premium/viewer' && ($method === 'GET' || $method === 'POST')) {
+    $auth = require_auth();
+    json_ok(premium_viewer_token($auth['uid']));
+}
+
 // Admin: grant premium by hand (payment settled offline, or a correction)
 if ($path === '/api/admin/premium/grant' && $method === 'POST') {
     require_admin();
@@ -1070,6 +1078,46 @@ if ($path === '/api/admin/premium' && $method === 'GET') {
         json_fail('uid required');
     }
     json_ok(['status' => premium_status($uid), 'history' => premium_history($uid)]);
+}
+
+// Admin: every account with the premium time it still has. Server clock and
+// end timestamp travel with each row so the panel can count down live.
+if ($path === '/api/admin/users' && ($method === 'GET' || $method === 'POST')) {
+    require_admin();
+    $now = time();
+    $q = strtolower(trim((string) ($_GET['q'] ?? '')));
+    $users = store_read_users();
+    $out = [];
+    foreach ($users as $u) {
+        $uid = store_user_uid($u);
+        if ($uid === '') {
+            continue;
+        }
+        $hay = strtolower((string) ($u['name'] ?? '') . ' ' . (string) ($u['username'] ?? '') . ' ' . (string) ($u['email'] ?? '') . ' ' . $uid);
+        if ($q !== '' && strpos($hay, $q) === false) {
+            continue;
+        }
+        $until = (int) premium_until($uid);
+        $out[] = [
+            'uid' => $uid,
+            'name' => (string) ($u['name'] ?? ''),
+            'username' => (string) ($u['username'] ?? ''),
+            'email' => (string) ($u['email'] ?? ''),
+            'referralCode' => (string) ($u['referralCode'] ?? ($u['referral_code'] ?? '')),
+            'referredBy' => (string) ($u['referredBy'] ?? ($u['referred_by'] ?? '')),
+            'createdAt' => (int) ($u['createdAt'] ?? ($u['at'] ?? 0)),
+            'premiumUntil' => $until,
+            'premiumActive' => $until > $now,
+            'remainingSeconds' => $until > $now ? ($until - $now) : 0,
+        ];
+    }
+    usort($out, function ($a, $b) {
+        if ($a['premiumActive'] !== $b['premiumActive']) {
+            return $a['premiumActive'] ? -1 : 1;
+        }
+        return $b['premiumUntil'] <=> $a['premiumUntil'];
+    });
+    json_ok(['users' => $out, 'serverNow' => $now, 'total' => count($users)]);
 }
 
 if ($path === '/api/admin/metadata' && $method === 'POST') {

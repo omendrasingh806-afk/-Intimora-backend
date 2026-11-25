@@ -419,6 +419,33 @@ function premium_token_check($token, $videoId, $kind) {
     return $payload;
 }
 
+// A short-lived viewer token: the browser exchanges its Firebase token once
+// (a preflight-free POST) and then sends this on the video reads. It carries a
+// uid and an end time only, so it can never be used as an account credential.
+function premium_viewer_token($uid, $ttl = 7200) {
+    $ttl = max(60, (int) $ttl);
+    $until = time() + $ttl;
+    $payload = ['u' => (string) $uid, 'e' => $until];
+    $body = premium_b64url(json_encode($payload, JSON_UNESCAPED_SLASHES));
+    $sig = hash_hmac('sha256', $body, PREMIUM_SECRET);
+    return ['viewer' => $body . '.' . $sig, 'until' => $until];
+}
+
+function premium_viewer_uid($token) {
+    if (!is_string($token) || $token === '' || strlen($token) > 4096 || !str_contains($token, '.')) {
+        return '';
+    }
+    [$body, $sig] = explode('.', $token, 2);
+    if (!hash_equals(hash_hmac('sha256', $body, PREMIUM_SECRET), $sig)) {
+        return '';
+    }
+    $payload = json_decode(premium_b64url_decode($body), true);
+    if (!is_array($payload) || (int) ($payload['e'] ?? 0) < time()) {
+        return '';
+    }
+    return (string) ($payload['u'] ?? '');
+}
+
 // === Video shaping ==========================================================
 
 function premium_video_flag($video) {
@@ -521,6 +548,13 @@ function premium_shape_video($pub, $video, $uid, $detail = false) {
 // verify_firebase_token(): a signed-in visitor must not pay a Firebase round
 // trip on every video list request.
 function premium_uid_optional() {
+    // The signed viewer token is the preflight-free way a browser identifies
+    // itself on a plain video GET; it wins because it is the one this client sent.
+    $viewerUid = premium_viewer_uid((string) ($_GET['viewer'] ?? ''));
+    if ($viewerUid !== '') {
+        return $viewerUid;
+    }
+
     $token = '';
     if (function_exists('get_bearer_token')) {
         $token = (string) (get_bearer_token() ?? '');
