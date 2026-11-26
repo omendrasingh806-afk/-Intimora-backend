@@ -304,7 +304,9 @@ app.get("/api/videos", async (req, res) => {
     const metas = await store.listVideos(cursor, limit);
     const uid = await optionalUid(req);
     const videos = await withDirectLinks(await Promise.all(metas.map((m) => premium.shapeVideo(publicVideo(m), m, uid))));
-    const nextCursor = videos.length ? metas[metas.length - 1].createdAt : null;
+    // A short page is the end, and the cursor must not repeat the last item's
+    // timestamp forever (the list would never finish loading).
+    const nextCursor = videos.length >= limit ? metas[metas.length - 1].createdAt : null;
     ok(res, { videos, nextCursor });
   } catch (e) { fail(res, e.message, 500); }
 });

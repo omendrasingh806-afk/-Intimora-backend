@@ -523,7 +523,9 @@ if ($path === '/api/videos' && $method === 'GET') {
     $videos = public_list_with_direct_links(array_map(function ($v) use ($uid) {
         return premium_shape_video(store_public_video($v), $v, $uid);
     }, $metas));
-    $nextCursor = $videos ? (int) $metas[count($metas) - 1]['createdAt'] : null;
+    // A short page is the end: a cursor equal to the last item's timestamp would
+    // repeat that item and never let the scroll finish.
+    $nextCursor = count($metas) >= $limit ? (int) $metas[count($metas) - 1]['createdAt'] : null;
 
     // An anonymous list is the same for every visitor, so the browser (and the
     // hosting proxy) may reuse it for a few seconds: repeat visits paint from

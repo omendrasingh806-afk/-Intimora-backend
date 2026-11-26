@@ -381,6 +381,39 @@ function store_newest_msg_id($videos) {
     return $newest;
 }
 
+// The channel is a log of upload messages, so the same file sent twice is two
+// records and the catalogue shows it twice. Two records that carry the same
+// video file are one video: the newest is kept and the older copies drop out of
+// every listing and search. Size plus duration identifies the file even when a
+// re-upload gave it a new Telegram document; the document id covers a record
+// that is missing one of the two numbers.
+function store_media_key($m) {
+    $video = is_array($m['video'] ?? null) ? $m['video'] : [];
+    $size = (int) ($video['size'] ?? ($video['tg_size'] ?? 0));
+    $duration = (int) ($m['duration'] ?? 0);
+    if ($size > 0 && $duration > 0) {
+        return $size . ':' . $duration;
+    }
+    $docId = (string) ($video['docId'] ?? ($video['tg_doc_id'] ?? ''));
+    return $docId !== '' ? 'doc:' . $docId : '';
+}
+
+function store_dedupe_videos($videos) {
+    $seen = [];
+    $out = [];
+    foreach ($videos as $m) {
+        $key = store_media_key($m);
+        if ($key !== '') {
+            if (isset($seen[$key])) {
+                continue;
+            }
+            $seen[$key] = true;
+        }
+        $out[] = $m;
+    }
+    return $out;
+}
+
 // All video metadata, newest first
 function store_read_videos($force = false) {
     if (!$force) {
@@ -401,6 +434,7 @@ function store_read_videos($force = false) {
     usort($videos, function ($a, $b) {
         return ((int) ($b['createdAt'] ?? 0)) <=> ((int) ($a['createdAt'] ?? 0));
     });
+    $videos = store_dedupe_videos($videos);
 
     store_cache('videos', $videos);
     return $videos;
@@ -456,7 +490,7 @@ function store_refresh_videos() {
     usort($merged, function ($a, $b) {
         return ((int) ($b['createdAt'] ?? 0)) <=> ((int) ($a['createdAt'] ?? 0));
     });
-    store_cache('videos', $merged);
+    store_cache('videos', store_dedupe_videos($merged));
 }
 
 // Legacy name kept for existing callers
@@ -474,11 +508,19 @@ function store_list_videos($cursor = 0, $limit = 12) {
 
     if ($cursor) {
         $start = 0;
+        $found = false;
+        // The cursor is the createdAt of the last item already sent, so the next
+        // page starts strictly after it: an inclusive compare repeated that item
+        // on every page and never let the cursor move past it.
         foreach ($metas as $i => $m) {
-            if (((int) ($m['createdAt'] ?? 0)) <= (int) $cursor) {
+            if (((int) ($m['createdAt'] ?? 0)) < (int) $cursor) {
                 $start = $i;
+                $found = true;
                 break;
             }
+        }
+        if (!$found) {
+            return [];
         }
         return array_slice($metas, $start, $limit);
     }

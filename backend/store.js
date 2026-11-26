@@ -37,12 +37,43 @@ const METADATA_TTL_MS = Math.max(1000, Number(process.env.METADATA_CACHE_MS) || 
 let metaCache = null; // { at, metas }
 let metaInflight = null;
 
+// The channel is a log of upload messages, so the same file sent twice is two
+// records and the catalogue shows it twice. Two records that carry the same
+// video file are one video: the newest record is kept and the older copies drop
+// out of every listing and search. Size plus duration identifies the file even
+// when a re-upload gave it a new Telegram document; the document id covers a
+// record that is missing one of the two numbers.
+function mediaKey(m) {
+  const video = m.video || {};
+  const size = Number(video.size || video.tg_size || 0);
+  const duration = Number(m.duration || 0);
+  if (size > 0 && duration > 0) return `${size}:${duration}`;
+  const docId = String(video.docId || video.tg_doc_id || "");
+  return docId ? `doc:${docId}` : "";
+}
+
+function dedupeMetas(metas) {
+  const seen = new Set();
+  const out = [];
+  const sorted = metas.slice().sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+  for (const m of sorted) {
+    const key = mediaKey(m);
+    if (key) {
+      if (seen.has(key)) continue;
+      seen.add(key);
+    }
+    out.push(m);
+  }
+  return out;
+}
+
 function refreshMetas() {
   if (!metaInflight) {
     metaInflight = tg.readMetadataFromTelegram(5000)
       .then((metas) => {
-        metaCache = { at: Date.now(), metas };
-        return metas;
+        const deduped = dedupeMetas(metas);
+        metaCache = { at: Date.now(), metas: deduped };
+        return deduped;
       })
       .catch((e) => {
         // A slightly old catalogue beats an error page.
@@ -78,9 +109,14 @@ async function listVideos(cursor, limit = 12) {
   const metas = (await readMetas()).filter(m => m.external !== true);
   metas.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
   if (cursor) {
-    const idx = metas.findIndex(m => (m.createdAt || 0) <= cursor);
-    const start = idx === -1 ? 0 : idx;
-    return metas.slice(start, start + limit);
+    // The cursor is the createdAt of the last item already sent, so the next
+    // page starts strictly after it: an inclusive compare repeated that item on
+    // every page and never let the cursor move past it.
+    const idx = metas.findIndex(m => (m.createdAt || 0) < cursor);
+    // Nothing older is left: the list is over. Restarting at the first page here
+    // made the scroll loop the catalogue forever.
+    if (idx === -1) return [];
+    return metas.slice(idx, idx + limit);
   }
   return metas.slice(0, limit);
 }
