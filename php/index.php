@@ -234,6 +234,20 @@ function json_fail($error, $code = 400) {
     exit;
 }
 
+// An uncaught error (Telegram/TL, BestFile, anything) must never reach the
+// browser as a PHP stack trace: every API route answers JSON, and a trace is
+// both unreadable to the frontend and leaks file paths. The details go to the
+// error log, the client gets a short JSON 503.
+set_exception_handler(function ($e) {
+    error_log('[intimora] uncaught ' . get_class($e) . ': ' . $e->getMessage());
+    if (!headers_sent()) {
+        http_response_code(503);
+        header('Content-Type: application/json');
+        header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
+        echo json_encode(['ok' => false, 'error' => 'Service temporarily unavailable']);
+    }
+});
+
 function json_body() {
     // Cached: the auth token may be read out of the body (see get_bearer_token)
     // and route handlers read the same body again.

@@ -50,7 +50,21 @@ function premium_ledger($fresh = false) {
     }
 
     $entries = [];
-    $messages = store_read_messages(TG_CHANNEL_PREMIUM);
+    try {
+        $messages = store_read_messages(TG_CHANNEL_PREMIUM);
+    } catch (\Throwable $e) {
+        // Premium gating runs on every video list, so a failed Telegram read
+        // must not take the API down with it: serve the last good snapshot
+        // (fc_peek ignores the TTL) and only give up when this host has none.
+        $stale = function_exists('fc_peek') ? fc_peek('prem_ledger') : null;
+        if (is_array($stale)) {
+            $cache = $stale;
+            $at = time();
+            return $cache;
+        }
+        error_log('[intimora] premium ledger unavailable: ' . $e->getMessage());
+        return $cache = [];
+    }
     foreach ($messages as $msg) {
         $text = $msg['message'] ?? '';
         if (!is_string($text) || $text === '' || $text[0] !== '{') {

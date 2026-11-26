@@ -88,6 +88,16 @@ function mtproto_settings() {
     $settings->getAppInfo()
         ->setApiId((int) TG_API_ID)
         ->setApiHash(TG_API_HASH);
+
+    // Telegram still answers this auth key at layer 231 (the login string was
+    // exported at that layer) while MadelineProto parses at layer 233, so a
+    // layer-231 `channel` used to abort deserialization with "Could not extract
+    // type: Chat with id d49f34c6" and kill the whole request. The extra scheme
+    // adds the layer-231 constructors next to the 233 ones (see tl-extra.tl).
+    $extraTl = __DIR__ . '/tl-extra.tl';
+    if (is_file($extraTl)) {
+        $settings->getSchema()->setOther(['legacy' => $extraTl]);
+    }
     // Logs must never reach the HTTP response body
     $settings->getLogger()
         ->setType(Logger::FILE_LOGGER)
