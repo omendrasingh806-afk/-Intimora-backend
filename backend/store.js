@@ -25,12 +25,57 @@ function toStreamFormat(m) {
   };
 }
 
+// ---- Metadata cache ----
+// Reading the catalogue used to walk the whole META channel (up to 5000
+// messages) inside the live request: on a free instance that is ~90 s, far past
+// the gateway's timeout, so the visitor got a 500 instead of the list. One copy
+// is kept per process and served instantly. After the TTL the copy is still
+// served while it refreshes behind the request (stale-while-revalidate), and
+// concurrent requests share a single channel read. A write drops or patches the
+// copy, so an upload, a delete or a like is visible at once.
+const METADATA_TTL_MS = Math.max(1000, Number(process.env.METADATA_CACHE_MS) || 60000);
+let metaCache = null; // { at, metas }
+let metaInflight = null;
+
+function refreshMetas() {
+  if (!metaInflight) {
+    metaInflight = tg.readMetadataFromTelegram(5000)
+      .then((metas) => {
+        metaCache = { at: Date.now(), metas };
+        return metas;
+      })
+      .catch((e) => {
+        // A slightly old catalogue beats an error page.
+        if (!metaCache) throw e;
+        console.error("metadata refresh failed, serving cached copy:", e.message);
+        return metaCache.metas;
+      })
+      .finally(() => { metaInflight = null; });
+  }
+  return metaInflight;
+}
+
+async function readMetas() {
+  if (!metaCache) return (await refreshMetas()).slice();
+  if (Date.now() - metaCache.at > METADATA_TTL_MS) refreshMetas().catch(() => {});
+  return metaCache.metas.slice();
+}
+
+// Keep the cached copy in step with a stats edit instead of dropping it: a view
+// or a like must not make the next visitor pay for a full channel read.
+function patchMeta(id, updates) {
+  const record = metaCache && metaCache.metas.find((m) => m.id === id);
+  if (record) Object.assign(record, updates);
+}
+
+function invalidateMetas() { metaCache = null; }
+
 // ---- List videos (infinite scroll) ----
-// Fetches all metadata messages, sorts by createdAt desc, paginates by cursor.
+// Reads the cached metadata, sorts by createdAt desc, paginates by cursor.
 async function listVideos(cursor, limit = 12) {
   // Third-party records exist only so a user can like/save them; they are not
   // part of our catalogue and must never appear in a listing.
-  const metas = (await tg.readMetadataFromTelegram(5000)).filter(m => m.external !== true);
+  const metas = (await readMetas()).filter(m => m.external !== true);
   metas.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
   if (cursor) {
     const idx = metas.findIndex(m => (m.createdAt || 0) <= cursor);
@@ -47,7 +92,7 @@ async function getVideo(id) {
 
 // ---- Search videos by title ----
 async function searchVideos(query) {
-  const metas = (await tg.readMetadataFromTelegram(5000)).filter(m => m.external !== true);
+  const metas = (await readMetas()).filter(m => m.external !== true);
   const q = query.toLowerCase().trim();
   return metas.filter(m => (m.title || "").toLowerCase().includes(q));
 }
@@ -111,6 +156,7 @@ async function registerExternalVideo(id, data) {
   if (!metadata) return null;
   const msgId = await tg.sendMetadata(metadata);
   externalSeen.add(id);
+  invalidateMetas();
   return { ...metadata, _msgId: msgId };
 }
 
@@ -118,6 +164,7 @@ async function registerExternalVideo(id, data) {
 async function addVideo(data) {
   const metadata = tg.buildMetadata(data);
   const msgId = await tg.sendMetadata(metadata);
+  invalidateMetas();
   return { ...metadata, meta_msg_id: msgId };
 }
 
@@ -125,7 +172,9 @@ async function addVideo(data) {
 async function incrementViews(id) {
   const v = await tg.findVideoById(id);
   if (!v) return null;
-  return await tg.updateVideoStats(id, { views: (v.views || 0) + 1 });
+  const updated = await tg.updateVideoStats(id, { views: (v.views || 0) + 1 });
+  if (updated) patchMeta(id, { views: updated.views });
+  return updated;
 }
 
 // ---- Toggle like / unlike ----
@@ -138,12 +187,14 @@ async function toggleLike(id, userId) {
       likedBy: likedBy.filter(u => u !== userId),
       likes: Math.max(0, (v.likes || 0) - 1),
     });
+    patchMeta(id, { likedBy: result.likedBy, likes: result.likes });
     return { liked: false, likes: result.likes };
   } else {
     const result = await tg.updateVideoStats(id, {
       likedBy: [...likedBy, userId],
       likes: (v.likes || 0) + 1,
     });
+    patchMeta(id, { likedBy: result.likedBy, likes: result.likes });
     return { liked: true, likes: result.likes };
   }
 }
@@ -152,17 +203,21 @@ async function toggleLike(id, userId) {
 async function incrementShares(id) {
   const v = await tg.findVideoById(id);
   if (!v) return null;
-  return await tg.updateVideoStats(id, { shares: (v.shares || 0) + 1 });
+  const updated = await tg.updateVideoStats(id, { shares: (v.shares || 0) + 1 });
+  if (updated) patchMeta(id, { shares: updated.shares });
+  return updated;
 }
 
 // ---- Delete video (deletes all 3 messages from Telegram) ----
 async function deleteVideo(id) {
-  return await tg.deleteVideoMessages(id);
+  const result = await tg.deleteVideoMessages(id);
+  if (result && result.deleted) invalidateMetas();
+  return result;
 }
 
 // ---- Get all videos (admin list) ----
 async function listAllVideos() {
-  const metas = await tg.readMetadataFromTelegram(5000);
+  const metas = await readMetas();
   metas.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
   return metas;
 }

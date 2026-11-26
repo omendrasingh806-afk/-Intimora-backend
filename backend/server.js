@@ -197,12 +197,6 @@ function adminAuth(req, res, next) {
   next();
 }
 
-// ============================================================
-// PUBLIC API (no API key needed)
-// ============================================================
-
-app.get("/api/health", (req, res) => ok(res, { status: "up", time: Date.now() }));
-
 // ---- Single Telegram owner -------------------------------------------------
 // Telegram deactivates an auth key the moment two processes use it at the same
 // time ("concurrent usage"), and a function host (Vercel/Netlify) can start a
@@ -212,6 +206,34 @@ app.get("/api/health", (req, res) => ok(res, { status: "up", time: Date.now() })
 // it the function host simply refuses to open the session (see telegram.js),
 // which is safer than having the session killed for every server.
 const GATEWAY_URL = (process.env.TG_GATEWAY_URL || "").replace(/\/+$/, "");
+
+// A function host with no gateway cannot serve a single Telegram route: the
+// guard in telegram.js refuses to open the session (two processes on one
+// session make Telegram deactivate it). That used to surface as a 500 on every
+// API call, which reads as a "random rejection" to the visitor. A 503 says the
+// same thing in a way the load balancer understands: it marks this host dead
+// and serves the same request from the next one, and an unanswered /api/health
+// keeps the host out of the list handed to a browser in the first place.
+const GATEWAY_MISSING = tg.isServerless() && !GATEWAY_URL;
+
+if (GATEWAY_MISSING) {
+  console.error("[config] TG_GATEWAY_URL is not set on this function host — API routes answer 503 until it is.");
+  app.use("/api", (req, res) => {
+    const note = "This host does not own the Telegram session; set TG_GATEWAY_URL to the Render service that does.";
+    res.set("Retry-After", "30");
+    if (req.path === "/health") return res.status(503).json({ ok: false, error: "gateway not configured: " + note });
+    return res.status(503).json({ ok: false, error: note });
+  });
+}
+
+// ============================================================
+// PUBLIC API (no API key needed)
+// ============================================================
+
+// `/api/health` answers 200 only when this host can actually serve the API: a
+// function host without its gateway is then skipped by the load balancer's
+// health check instead of being handed to a browser and failing there.
+app.get("/api/health", (req, res) => ok(res, { status: "up", time: Date.now(), telegram: GATEWAY_URL ? "gateway" : "local" }));
 
 if (GATEWAY_URL && tg.isServerless()) {
   app.use(async (req, res) => {
@@ -834,5 +856,11 @@ if (require.main === module) {
     console.log(`Video channel:     ${process.env.TELEGRAM_CHANNEL_VIDEO || "(not set)"}`);
     console.log(`Thumbnail channel: ${process.env.TELEGRAM_CHANNEL_THUMB || "(not set)"}`);
     console.log(`Metadata channel:  ${process.env.TELEGRAM_CHANNEL_META || "(not set)"}`);
+    // Warm the catalogue cache in the background: the first channel read is the
+    // slow one, so it should not be a visitor's request that waits for it. A
+    // guarded function host has no session to read with, so it skips this.
+    if (!GATEWAY_MISSING) {
+      store.listVideos(0, 1).catch((e) => console.error("catalogue warm-up failed:", e.message));
+    }
   });
 }
