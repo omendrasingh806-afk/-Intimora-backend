@@ -20,6 +20,10 @@
 // php: true  → is server par PHP bhi chal raha hai
 // php: false → sirf Node API, PHP nahi
 const SERVERS = [
+  // First on purpose: this is the persistent Render service that owns the one
+  // Telegram MTProto session (see render.yaml). It is checked and tried before
+  // every function host, and its self-ping keeps the free instance awake.
+  { url: "https://intimora-backend-pumn.onrender.com", php: false }, // Node API (session owner)
   { url: "https://intimora-api2.site.je",   php: true  },  // Node API + PHP
   { url: "http://intimora-api3.site.je",    php: true  },  // Node API + PHP
   { url: "https://api-intimora.vercel.app", php: false },  // Node API only
@@ -31,7 +35,11 @@ const serverHealth = {}; // { url: true/false }
 const failStreaks = {}; // { url: number }
 const suspendedUntil = {}; // { url: timestamp }
 
+// Two cursors on purpose: /api/get-server handing out a URL must not move the
+// forwarding rotation, otherwise the server at the top of the list is skipped
+// for the request that follows it.
 let roundRobinCursor = 0;
+let forwardCursor = 0;
 
 // === Headers to strip ===
 const STRIP_REQUEST_HEADERS = new Set([
@@ -70,8 +78,8 @@ function getNextServer() {
     return SERVERS[0];
   }
 
-  const server = available[roundRobinCursor % available.length];
-  roundRobinCursor++;
+  const server = available[forwardCursor % available.length];
+  forwardCursor++;
   return server;
 }
 

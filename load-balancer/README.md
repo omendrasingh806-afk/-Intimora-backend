@@ -2,9 +2,14 @@
 
 **No KV, no env vars, no config — just paste and deploy!**
 
-## Servers (hardcoded):
-1. `https://api-intimora.vercel.app`
-2. `https://intimora-api1.vercel.app`
+## Servers (hardcoded, order = rotation order):
+1. `https://intimora-backend-pumn.onrender.com` — persistent Render service, Telegram session ka owner (php: false)
+2. `https://intimora-api2.site.je` — Node + PHP
+3. `http://intimora-api3.site.je` — Node + PHP
+4. `https://api-intimora.vercel.app` — Node only
+5. `https://intimora-api1.vercel.app` — Node only
+
+Render sabse pehle check aur use hota hai (`/api/health` har 2 min), taaki wahi ek process session serve kare.
 
 ---
 
@@ -31,12 +36,11 @@ Should return: `{"ok":true,"data":{"status":"up"}}`
 ---
 
 ## Adding More Servers:
-`src/index.js` me `SERVERS` array me URL add karo:
+`src/index.js` me `SERVERS` array me entry add karo (`php: true` sirf un hosts par jinke paas PHP bhi hai):
 ```javascript
 const SERVERS = [
-  "https://api-intimora.vercel.app",
-  "https://intimora-api1.vercel.app",
-  "https://third-intimora.vercel.app",
+  { url: "https://intimora-backend-pumn.onrender.com", php: false },
+  { url: "https://third-intimora.vercel.app", php: false },
 ];
 ```
 Phir redeploy karo.
