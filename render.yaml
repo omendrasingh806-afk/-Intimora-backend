@@ -22,6 +22,11 @@ services:
     name: content-site
     runtime: node
     plan: free
+    # Exactly one process may hold the MTProto session: a second instance using
+    # the same auth key makes Telegram deactivate it ("concurrent usage"), and
+    # every other host that shares that session starts failing too. This service
+    # is that single owner — function hosts forward to it via TG_GATEWAY_URL.
+    numInstances: 1
     autoDeploy: true
     buildCommand: npm install
     startCommand: npm run start:persistent

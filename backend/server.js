@@ -3,6 +3,7 @@
 // Compatible with Netlify (serverless-http) and local (node functions/server.js).
 const express = require("express");
 const path = require("path");
+const { Readable } = require("stream");
 const serverless = require("serverless-http");
 
 const store = require("./store");
@@ -201,6 +202,48 @@ function adminAuth(req, res, next) {
 // ============================================================
 
 app.get("/api/health", (req, res) => ok(res, { status: "up", time: Date.now() }));
+
+// ---- Single Telegram owner -------------------------------------------------
+// Telegram deactivates an auth key the moment two processes use it at the same
+// time ("concurrent usage"), and a function host (Vercel/Netlify) can start a
+// second process for any request. So exactly one long-running process owns a
+// session; a function host forwards here to it instead of connecting itself.
+// TG_GATEWAY_URL = the owner (e.g. https://content-site.onrender.com). Without
+// it the function host simply refuses to open the session (see telegram.js),
+// which is safer than having the session killed for every server.
+const GATEWAY_URL = (process.env.TG_GATEWAY_URL || "").replace(/\/+$/, "");
+
+if (GATEWAY_URL && tg.isServerless()) {
+  app.use(async (req, res) => {
+    try {
+      const headers = { ...req.headers };
+      delete headers.host;
+      delete headers.connection;
+      delete headers["content-length"];
+      delete headers["content-encoding"];
+      headers["accept-encoding"] = "identity";
+
+      const hasBody = req.method !== "GET" && req.method !== "HEAD";
+      const upstream = await fetch(GATEWAY_URL + req.originalUrl, {
+        method: req.method,
+        headers,
+        body: hasBody && req.body && Object.keys(req.body).length ? JSON.stringify(req.body) : undefined,
+        redirect: "manual",
+      });
+
+      res.status(upstream.status);
+      upstream.headers.forEach((value, key) => {
+        if (["connection", "keep-alive", "transfer-encoding", "content-encoding"].includes(key)) return;
+        res.setHeader(key, value);
+      });
+      if (!upstream.body) return res.end();
+      // Stream straight through: video ranges must not be buffered in memory.
+      Readable.fromWeb(upstream.body).pipe(res);
+    } catch (e) {
+      fail(res, "Telegram gateway unavailable: " + e.message, 502);
+    }
+  });
+}
 
 // ---- PHP backend proxy ----
 // The PHP servers sit behind a hosting-level browser challenge that blocks any

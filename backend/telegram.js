@@ -50,9 +50,34 @@ function channelAccounts() {
   return process.env.TELEGRAM_CHANNEL_ACCOUNTS || "-1004393682063";
 }
 
+// A function host (Vercel, Netlify, Lambda) starts a fresh process for an
+// invocation and may run several of them at once. Two processes on one auth key
+// make Telegram deactivate the session ("concurrent usage"), and that kills the
+// session for every host that shares it.
+function isServerless() {
+  return !!(
+    process.env.VERCEL ||
+    process.env.VERCEL_ENV ||
+    process.env.NETLIFY ||
+    process.env.AWS_LAMBDA_FUNCTION_NAME ||
+    process.env.AWS_EXECUTION_ENV
+  );
+}
+
 let _clientLock = Promise.resolve();
 async function getClient() {
   if (_client && _client.isConnected && _client.isConnected()) return _client;
+  // One session = one process. A function host forwards to the process that
+  // owns the session (TG_GATEWAY_URL, see server.js) instead of opening it:
+  // the guard below makes that rule impossible to break by accident.
+  // TELEGRAM_SERVERLESS_CLIENT=1 is only for a single-instance function host
+  // that is the sole owner of its own session.
+  if (isServerless() && process.env.TELEGRAM_SERVERLESS_CLIENT !== "1") {
+    throw new Error(
+      "Function host must not open the Telegram session: two processes on one session make Telegram deactivate it. " +
+        "Point TG_GATEWAY_URL at the persistent backend (Render) so its single process serves every user."
+    );
+  }
   // Lock: prevent multiple clients being created with same session (causes "Concurrent usage" error)
   const prevLock = _clientLock;
   let resolveLock;
@@ -780,6 +805,7 @@ async function readMessages(channel, limit = 5000) {
 }
 
 module.exports = {
+  isServerless,
   channelPremium,
   channelAccounts,
   getClient,
