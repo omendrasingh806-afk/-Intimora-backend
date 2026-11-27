@@ -75,7 +75,7 @@ async function getClient() {
   if (isServerless() && process.env.TELEGRAM_SERVERLESS_CLIENT !== "1") {
     throw new Error(
       "Function host must not open the Telegram session: two processes on one session make Telegram deactivate it. " +
-        "Point TG_GATEWAY_URL at the persistent backend (Render) so its single process serves every user."
+        "Set TG_GATEWAY_URL (default: https://intimora-backend-pumn.onrender.com) so its single process serves every user."
     );
   }
   // Lock: prevent multiple clients being created with same session (causes "Concurrent usage" error)

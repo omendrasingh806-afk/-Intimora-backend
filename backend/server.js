@@ -202,10 +202,21 @@ function adminAuth(req, res, next) {
 // time ("concurrent usage"), and a function host (Vercel/Netlify) can start a
 // second process for any request. So exactly one long-running process owns a
 // session; a function host forwards here to it instead of connecting itself.
-// TG_GATEWAY_URL = the owner (e.g. https://content-site.onrender.com). Without
-// it the function host simply refuses to open the session (see telegram.js),
-// which is safer than having the session killed for every server.
-const GATEWAY_URL = (process.env.TG_GATEWAY_URL || "").replace(/\/+$/, "");
+// TG_GATEWAY_URL = the owner. It now defaults to the Render service from
+// render.yaml, so a function host needs no configuration: every visitor's call
+// is forwarded to the one process that holds the session, and that process
+// answers for all of them. Without the default a fresh Vercel deploy had no
+// owner to forward to, the guard in telegram.js refused, and the visitor saw a
+// 500 / "try again".
+//
+// TELEGRAM_SERVERLESS_CLIENT=1 is the only exception: a single-instance
+// function host that is the sole owner of its own session does not forward.
+const OWNER_URL = "https://intimora-backend-pumn.onrender.com";
+const SERVERLESS_OWNS_SESSION =
+  tg.isServerless() && process.env.TELEGRAM_SERVERLESS_CLIENT === "1";
+const GATEWAY_URL =
+  (process.env.TG_GATEWAY_URL || "").replace(/\/+$/, "") ||
+  (tg.isServerless() && !SERVERLESS_OWNS_SESSION ? OWNER_URL : "");
 
 // A function host with no gateway cannot serve a single Telegram route: the
 // guard in telegram.js refuses to open the session (two processes on one
@@ -214,7 +225,8 @@ const GATEWAY_URL = (process.env.TG_GATEWAY_URL || "").replace(/\/+$/, "");
 // same thing in a way the load balancer understands: it marks this host dead
 // and serves the same request from the next one, and an unanswered /api/health
 // keeps the host out of the list handed to a browser in the first place.
-const GATEWAY_MISSING = tg.isServerless() && !GATEWAY_URL;
+const GATEWAY_MISSING =
+  tg.isServerless() && !GATEWAY_URL && !SERVERLESS_OWNS_SESSION;
 
 if (GATEWAY_MISSING) {
   console.error("[config] TG_GATEWAY_URL is not set on this function host — API routes answer 503 until it is.");
@@ -244,6 +256,10 @@ if (GATEWAY_URL && tg.isServerless()) {
       delete headers["content-length"];
       delete headers["content-encoding"];
       headers["accept-encoding"] = "identity";
+      // A request that already passed through a gateway is never forwarded
+      // again: a loop would hold the visitor until the function timed out.
+      if (headers["x-tg-gateway-hop"]) return fail(res, "Gateway loop", 508);
+      headers["x-tg-gateway-hop"] = "1";
 
       const hasBody = req.method !== "GET" && req.method !== "HEAD";
       const upstream = await fetch(GATEWAY_URL + req.originalUrl, {
@@ -262,7 +278,10 @@ if (GATEWAY_URL && tg.isServerless()) {
       // Stream straight through: video ranges must not be buffered in memory.
       Readable.fromWeb(upstream.body).pipe(res);
     } catch (e) {
-      fail(res, "Telegram gateway unavailable: " + e.message, 502);
+      // 503, not 500: the owner is asleep or restarting, and the same call
+      // works once it is back. The load balancer reads it as "not this host".
+      res.set("Retry-After", "15");
+      fail(res, "Telegram gateway unavailable: " + e.message, 503);
     }
   });
 }
