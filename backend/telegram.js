@@ -67,17 +67,12 @@ function isServerless() {
 let _clientLock = Promise.resolve();
 async function getClient() {
   if (_client && _client.isConnected && _client.isConnected()) return _client;
-  // One session = one process. A function host forwards to the process that
-  // owns the session (TG_GATEWAY_URL, see server.js) instead of opening it:
-  // the guard below makes that rule impossible to break by accident.
-  // TELEGRAM_SERVERLESS_CLIENT=1 is only for a single-instance function host
-  // that is the sole owner of its own session.
-  if (isServerless() && process.env.TELEGRAM_SERVERLESS_CLIENT !== "1") {
-    throw new Error(
-      "Function host must not open the Telegram session: two processes on one session make Telegram deactivate it. " +
-        "Set TG_GATEWAY_URL (default: https://intimora-backend-pumn.onrender.com) so its single process serves every user."
-    );
-  }
+  // A function host owns its own connection exactly like a persistent one, so a
+  // visitor's request never depends on another process being awake. That makes
+  // the session string per host: one string used by two live hosts makes
+  // Telegram deactivate it ("concurrent usage"), which then breaks every host
+  // sharing it. A host told to forward (TG_GATEWAY_URL in server.js) never
+  // reaches this function — the proxy answers before any route runs.
   // Lock: prevent multiple clients being created with same session (causes "Concurrent usage" error)
   const prevLock = _clientLock;
   let resolveLock;

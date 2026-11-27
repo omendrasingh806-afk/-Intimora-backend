@@ -197,46 +197,16 @@ function adminAuth(req, res, next) {
   next();
 }
 
-// ---- Single Telegram owner -------------------------------------------------
-// Telegram deactivates an auth key the moment two processes use it at the same
-// time ("concurrent usage"), and a function host (Vercel/Netlify) can start a
-// second process for any request. So exactly one long-running process owns a
-// session; a function host forwards here to it instead of connecting itself.
-// TG_GATEWAY_URL = the owner. It now defaults to the Render service from
-// render.yaml, so a function host needs no configuration: every visitor's call
-// is forwarded to the one process that holds the session, and that process
-// answers for all of them. Without the default a fresh Vercel deploy had no
-// owner to forward to, the guard in telegram.js refused, and the visitor saw a
-// 500 / "try again".
+// ---- Per-host Telegram connection ------------------------------------------
+// Every host opens its own MTProto connection and answers every visitor itself:
+// Vercel, the PHP hosts and the Render service are independent, so one host
+// sleeping or restarting never makes another host fail, and Render is only used
+// when the load balancer (load-balancer/src) hands its URL out.
 //
-// TELEGRAM_SERVERLESS_CLIENT=1 is the only exception: a single-instance
-// function host that is the sole owner of its own session does not forward.
-const OWNER_URL = "https://intimora-backend-pumn.onrender.com";
-const SERVERLESS_OWNS_SESSION =
-  tg.isServerless() && process.env.TELEGRAM_SERVERLESS_CLIENT === "1";
-const GATEWAY_URL =
-  (process.env.TG_GATEWAY_URL || "").replace(/\/+$/, "") ||
-  (tg.isServerless() && !SERVERLESS_OWNS_SESSION ? OWNER_URL : "");
-
-// A function host with no gateway cannot serve a single Telegram route: the
-// guard in telegram.js refuses to open the session (two processes on one
-// session make Telegram deactivate it). That used to surface as a 500 on every
-// API call, which reads as a "random rejection" to the visitor. A 503 says the
-// same thing in a way the load balancer understands: it marks this host dead
-// and serves the same request from the next one, and an unanswered /api/health
-// keeps the host out of the list handed to a browser in the first place.
-const GATEWAY_MISSING =
-  tg.isServerless() && !GATEWAY_URL && !SERVERLESS_OWNS_SESSION;
-
-if (GATEWAY_MISSING) {
-  console.error("[config] TG_GATEWAY_URL is not set on this function host — API routes answer 503 until it is.");
-  app.use("/api", (req, res) => {
-    const note = "This host does not own the Telegram session; set TG_GATEWAY_URL to the Render service that does.";
-    res.set("Retry-After", "30");
-    if (req.path === "/health") return res.status(503).json({ ok: false, error: "gateway not configured: " + note });
-    return res.status(503).json({ ok: false, error: note });
-  });
-}
+// TG_GATEWAY_URL is an opt-in escape hatch, not a default: set it on a host that
+// genuinely cannot hold a session of its own and that host forwards to the given
+// owner instead of connecting. No platform implies it.
+const GATEWAY_URL = (process.env.TG_GATEWAY_URL || "").replace(/\/+$/, "");
 
 // ============================================================
 // PUBLIC API (no API key needed)
@@ -879,8 +849,8 @@ if (require.main === module) {
     console.log(`Metadata channel:  ${process.env.TELEGRAM_CHANNEL_META || "(not set)"}`);
     // Warm the catalogue cache in the background: the first channel read is the
     // slow one, so it should not be a visitor's request that waits for it. A
-    // guarded function host has no session to read with, so it skips this.
-    if (!GATEWAY_MISSING) {
+    // host that only forwards has no session to read with, so it skips this.
+    if (!GATEWAY_URL) {
       store.listVideos(0, 1).catch((e) => console.error("catalogue warm-up failed:", e.message));
     }
   });

@@ -62,10 +62,12 @@ const STRIP_RESPONSE_HEADERS = new Set([
 // === Get healthy servers ===
 function getHealthyServers() {
   const now = Date.now();
+  // Only a host whose own health check has answered is handed out. A PHP host
+  // behind a hosting browser challenge never answers /api/health, and offering
+  // it made the visitor's next call die with a 520 instead of loading.
   return SERVERS.filter((s) => {
     if (suspendedUntil[s.url] && suspendedUntil[s.url] > now) return false;
-    if (serverHealth[s.url] === false) return false;
-    return true;
+    return serverHealth[s.url] === true;
   });
 }
 
@@ -186,9 +188,9 @@ async function forwardRequest(request, server, bodyBuffer) {
       signal: controller.signal,
     });
 
-    // If server returns 404/410/503 on API routes, mark as dead
+    // If server returns 404/410 or any 5xx on API routes, mark as dead
     const url = new URL(request.url);
-    if (url.pathname.startsWith("/api/") && [404, 410, 503].includes(response.status)) {
+    if (url.pathname.startsWith("/api/") && (response.status >= 500 || response.status === 404 || response.status === 410)) {
       console.warn(`${serverUrl} returned ${response.status} on ${url.pathname} — marking dead`);
       serverHealth[serverUrl] = false;
       suspendedUntil[serverUrl] = Date.now() + 5 * 60 * 1000;
@@ -280,7 +282,7 @@ async function routeRequest(request) {
       const response = await forwardRequest(request, server, bodyBuffer);
 
       // Check if suspended response on API route
-      if (url.pathname.startsWith("/api/") && [404, 410, 503].includes(response.status)) {
+      if (url.pathname.startsWith("/api/") && (response.status >= 500 || response.status === 404 || response.status === 410)) {
         continue; // try next server
       }
 
