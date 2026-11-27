@@ -215,7 +215,12 @@ const GATEWAY_URL = (process.env.TG_GATEWAY_URL || "").replace(/\/+$/, "");
 // `/api/health` answers 200 only when this host can actually serve the API: a
 // function host without its gateway is then skipped by the load balancer's
 // health check instead of being handed to a browser and failing there.
-app.get("/api/health", (req, res) => ok(res, { status: "up", time: Date.now(), telegram: GATEWAY_URL ? "gateway" : "local" }));
+// `instance` identifies the process answering, so two visitors' calls can be
+// traced back to the single client that serves both of them.
+const INSTANCE_ID = Math.random().toString(36).slice(2, 10);
+app.get("/api/health", (req, res) =>
+  ok(res, { status: "up", time: Date.now(), telegram: GATEWAY_URL ? "gateway" : "local", instance: INSTANCE_ID })
+);
 
 if (GATEWAY_URL && tg.isServerless()) {
   app.use(async (req, res) => {

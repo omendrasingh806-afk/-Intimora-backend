@@ -64,7 +64,44 @@ function isServerless() {
   );
 }
 
+// Two visitors arriving together share ONE client: the singleton below is created
+// under this lock, so the second request waits for the first connection instead
+// of opening a competing one. That is the "one process serves every user" rule,
+// enforced inside a process.
 let _clientLock = Promise.resolve();
+
+// A second instance on the same session string makes Telegram answer
+// AUTH_KEY_DUPLICATED ("concurrent usage"). It is not the visitor's fault and it
+// clears by itself, so the connection is taken again a moment later instead of
+// turning that request into a failure.
+function isConcurrentUsageError(err) {
+  const text = String((err && (err.errorMessage || err.message)) || err);
+  return /concurrent|AUTH_KEY_DUPLICATED/i.test(text);
+}
+
+async function openClient() {
+  const { apiId, apiHash } = cfg();
+  const session = new StringSession(process.env.TELEGRAM_SESSION || "");
+  const client = new TelegramClient(session, apiId, apiHash, {
+    connectionRetries: 5,
+    maxConcurrentDownloads: 4,
+    downloadPool: { poolSize: 2, workers: 4, requestDeadlineMs: 60000 },
+  });
+  _client = client;
+  try {
+    await client.connect();
+    if (!(await client.isUserAuthorized())) {
+      throw new Error("Telegram session not authorized — run `npm run login` and set TELEGRAM_SESSION");
+    }
+    return client;
+  } catch (e) {
+    // Never keep a half-open client: the next request must build a clean one.
+    _client = null;
+    try { await client.disconnect(); } catch { /* socket never opened */ }
+    throw e;
+  }
+}
+
 async function getClient() {
   if (_client && _client.isConnected && _client.isConnected()) return _client;
   // A function host owns its own connection exactly like a persistent one, so a
@@ -73,7 +110,6 @@ async function getClient() {
   // Telegram deactivate it ("concurrent usage"), which then breaks every host
   // sharing it. A host told to forward (TG_GATEWAY_URL in server.js) never
   // reaches this function — the proxy answers before any route runs.
-  // Lock: prevent multiple clients being created with same session (causes "Concurrent usage" error)
   const prevLock = _clientLock;
   let resolveLock;
   _clientLock = new Promise((r) => { resolveLock = r; });
@@ -82,18 +118,14 @@ async function getClient() {
     await prevLock;
     // Re-check after acquiring lock (another request may have already created the client)
     if (_client && _client.isConnected && _client.isConnected()) return _client;
-    const { apiId, apiHash } = cfg();
-    const session = new StringSession(process.env.TELEGRAM_SESSION || "");
-    _client = new TelegramClient(session, apiId, apiHash, {
-      connectionRetries: 5,
-      maxConcurrentDownloads: 4,
-      downloadPool: { poolSize: 2, workers: 4, requestDeadlineMs: 60000 },
-    });
-    await _client.connect();
-    if (!(await _client.isUserAuthorized())) {
-      throw new Error("Telegram session not authorized — run `npm run login` and set TELEGRAM_SESSION");
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        return await openClient();
+      } catch (e) {
+        if (!isConcurrentUsageError(e) || attempt === 2) throw e;
+        await new Promise((r) => setTimeout(r, 300 * (attempt + 1)));
+      }
     }
-    return _client;
   } finally {
     resolveLock();
   }
