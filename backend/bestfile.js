@@ -9,6 +9,7 @@
 
 const https = require("https");
 const http = require("http");
+const tls = require("tls");
 
 const BF_HOST = "bestfile.io";
 const BF_UA =
@@ -59,36 +60,92 @@ const BROWSER_HEADERS = {
   "Upgrade-Insecure-Requests": "1",
 };
 
-// Raw request to any host. Always resolves/rejects within REQ_TIMEOUT_MS.
-function rawRequest(urlStr, { method = "GET", headers = {}, body = null } = {}) {
-  return new Promise((resolve, reject) => {
-    const u = new URL(urlStr);
-    const mod = u.protocol === "http:" ? http : https;
-    const finalHeaders = { ...BROWSER_HEADERS, ...headers };
-    if (body) finalHeaders["Content-Length"] = Buffer.byteLength(body);
+// Vercel and Render give every function their own datacenter address and offer no
+// way to change it, and that address is the whole reason bestfile.io answers with
+// a managed challenge. The only way to change it is to leave from somewhere else:
+// BESTFILE_PROXY_URL (http:// or https://, optional user:pass) tunnels every
+// BestFile call through a host with a clean IP. Unset, calls go out exactly as
+// before, so a platform without a proxy keeps working the way it did.
+const BF_PROXY = String(process.env.BESTFILE_PROXY_URL || "").trim();
 
-    const req = mod.request(
-      {
-        hostname: u.hostname,
-        path: u.pathname + u.search,
-        method,
-        headers: finalHeaders,
-        timeout: REQ_TIMEOUT_MS,
-        agent: u.protocol === "http:" ? httpAgent : httpsAgent,
-        family: 4,
-      },
-      (res) => {
-        const chunks = [];
-        res.on("data", (d) => chunks.push(d));
-        res.on("end", () =>
-          resolve({
-            status: res.statusCode,
-            headers: res.headers,
-            body: Buffer.concat(chunks).toString("utf-8"),
-          })
-        );
+function proxyTunnel(host, port) {
+  return new Promise((resolve, reject) => {
+    let p;
+    try {
+      p = new URL(BF_PROXY);
+    } catch {
+      reject(new Error("BESTFILE_PROXY_URL is not a valid URL"));
+      return;
+    }
+    const secure = p.protocol === "https:";
+    const mod = secure ? https : http;
+    const headers = {};
+    if (p.username) {
+      const cred = decodeURIComponent(p.username) + ":" + decodeURIComponent(p.password || "");
+      headers["Proxy-Authorization"] = "Basic " + Buffer.from(cred).toString("base64");
+    }
+    const req = mod.request({
+      hostname: p.hostname,
+      port: Number(p.port || (secure ? 443 : 80)),
+      method: "CONNECT",
+      path: host + ":" + port,
+      headers,
+      timeout: REQ_TIMEOUT_MS,
+      agent: false,
+      family: 4,
+    });
+    req.on("connect", (res, socket) => {
+      if (res.statusCode !== 200) {
+        socket.destroy();
+        reject(new Error("BestFile proxy refused CONNECT (" + res.statusCode + ")"));
+        return;
       }
-    );
+      resolve(socket);
+    });
+    req.on("timeout", () => req.destroy(new Error("BestFile proxy connect timed out")));
+    req.on("error", reject);
+    req.end();
+  });
+}
+
+// Raw request to any host. Always resolves/rejects within REQ_TIMEOUT_MS.
+async function rawRequest(urlStr, { method = "GET", headers = {}, body = null } = {}) {
+  const u = new URL(urlStr);
+  const mod = u.protocol === "http:" ? http : https;
+  const finalHeaders = { ...BROWSER_HEADERS, ...headers };
+  if (body) finalHeaders["Content-Length"] = Buffer.byteLength(body);
+
+  const options = {
+    hostname: u.hostname,
+    path: u.pathname + u.search,
+    method,
+    headers: finalHeaders,
+    timeout: REQ_TIMEOUT_MS,
+    family: 4,
+  };
+  if (BF_PROXY) {
+    // One tunnel per hop: a CONNECT socket belongs to a single host, and the
+    // redirect chain crosses bestfile.io -> Backblaze anyway.
+    const port = Number(u.port || (u.protocol === "http:" ? 80 : 443));
+    const socket = await proxyTunnel(u.hostname, port);
+    options.createConnection =
+      u.protocol === "http:" ? () => socket : () => tls.connect({ socket, servername: u.hostname });
+  } else {
+    options.agent = u.protocol === "http:" ? httpAgent : httpsAgent;
+  }
+
+  return new Promise((resolve, reject) => {
+    const req = mod.request(options, (res) => {
+      const chunks = [];
+      res.on("data", (d) => chunks.push(d));
+      res.on("end", () =>
+        resolve({
+          status: res.statusCode,
+          headers: res.headers,
+          body: Buffer.concat(chunks).toString("utf-8"),
+        })
+      );
+    });
     req.on("timeout", () => req.destroy(new Error("BestFile request timed out (" + urlStr + ")")));
     req.on("error", reject);
     if (body) req.end(body);
@@ -280,7 +337,7 @@ function challengeFingerprint(r) {
 // else.
 async function bfProbe(pageId) {
   const id = String(pageId || "").replace(/[^A-Za-z0-9_-]/g, "");
-  const out = { id, steps: [] };
+  const out = { id, egress: BF_PROXY ? "proxy" : "direct", steps: [] };
   if (!id) return out;
   const started = Date.now();
   const step = (name, extra) => out.steps.push({ step: name, ms: Date.now() - started, ...extra });
