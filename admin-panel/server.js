@@ -315,6 +315,29 @@ function bfStoreCookies(setCookie) {
     if (m) bfCookies[m[1].trim()] = m[2];
   }
 }
+
+// Copy the signed-in Chrome session (cookies + User-Agent) into the Node session,
+// so the plain HTTPS upload can reuse the Cloudflare clearance as well. Without
+// this the Node request has no cookies while the window is open, and every upload
+// is pushed through the page instead.
+async function bfSyncBrowserSession() {
+  if (!bfHasBrowser()) return false;
+  try {
+    const cookies = await bfBrowserContext.cookies(`https://${BF_HOST}`);
+    if (!cookies.length) return false;
+    bfCookies = {};
+    for (const c of cookies) bfCookies[c.name] = c.value;
+    const ua = await bfBrowserPage.evaluate(() => navigator.userAgent).catch(() => '');
+    if (ua && ua !== BF_UA) {
+      BF_UA = ua;
+      config.bestfileUserAgent = ua;
+      try { saveConfig(); } catch {}
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
 // Low-level request. body: string (urlencoded) or null.
 function bfRequest(method, reqPath, { headers = {}, body = null } = {}) {
   if (bfHasBrowser()) {
@@ -665,14 +688,27 @@ async function bfUpload(job, filePath, from, to) {
   });
 
   await bfEnsureLogin();
-  if (bfHasBrowser()) return bfBrowserUpload(filePath, tick, size);
+  // Plain HTTPS upload first, even while the Chrome window is open: it reuses that
+  // window's cookies (Cloudflare clearance included) once they are copied over, and
+  // it cannot hang waiting for a page element the way the in-page upload can.
+  await bfSyncBrowserSession();
   try {
     return await attempt(bfCsrf);
   } catch (e) {
     // Session may have expired (CSRF 419 / redirect) -> fresh login once and retry.
-    bfLoggedIn = false;
-    await bfLogin();
-    return await attempt(bfCsrf);
+    let retryError = e;
+    try {
+      bfLoggedIn = false;
+      await bfLogin();
+      await bfSyncBrowserSession();
+      return await attempt(bfCsrf);
+    } catch (e2) {
+      retryError = e2;
+    }
+    if (!bfHasBrowser()) throw retryError;
+    // Cloudflare may only accept a request that comes from the page itself.
+    jlog(job, 'BestFile: HTTPS upload failed → ' + retryError.message + '. Trying the Chrome window…');
+    return await bfBrowserUpload(filePath, tick, size);
   }
 }
 
@@ -681,24 +717,33 @@ async function bfUpload(job, filePath, from, to) {
 async function bfBrowserUpload(filePath, tick, size) {
   const page = bfBrowserPage;
   const fileName = path.basename(filePath);
-  const input = await page.evaluateHandle(() => {
+  // The file input is addressed by id through a locator so it is resolved again on
+  // every attempt: a one-shot element handle goes stale after any navigation and
+  // makes setInputFiles sit there until its 30s timeout.
+  if (!page.url().includes(BF_HOST)) {
+    await page.goto(`https://${BF_HOST}/en`, { waitUntil: 'domcontentloaded', timeout: 60000 });
+  }
+  await page.evaluate(() => {
+    document.getElementById('__bf-upload')?.remove();
     const input = document.createElement('input');
+    input.id = '__bf-upload';
     input.type = 'file';
-    input.hidden = true;
+    input.style.cssText = 'position:fixed;left:-9999px;top:0;width:1px;height:1px;opacity:0';
     document.body.appendChild(input);
-    return input;
   });
   let res;
   let progressTimer;
   try {
-    await input.asElement().setInputFiles(filePath);
+    await page.locator('#__bf-upload').setInputFiles(filePath, { timeout: 60000 });
     await page.evaluate(() => { window.__bfUploadProgress = 0; });
     progressTimer = setInterval(() => {
       page.evaluate(() => window.__bfUploadProgress || 0)
         .then((loaded) => tick(Math.min(loaded, Math.max(0, size - 1)), size)).catch(() => {});
     }, 1000);
-    res = await page.evaluate(({ input, fileName, size, csrf }) => new Promise((resolve, reject) => {
+    res = await page.evaluate(({ fileName, size, csrf }) => new Promise((resolve, reject) => {
       if (location.origin !== 'https://bestfile.io') return reject(new Error('BestFile tab changed; login dobara karo.'));
+      const input = document.getElementById('__bf-upload');
+      if (!input || !input.files || !input.files[0]) return reject(new Error('BestFile file input missing'));
       const form = new FormData();
       form.append('file', input.files[0], fileName);
       form.append('upload_auto_delete', '0');
@@ -714,11 +759,10 @@ async function bfBrowserUpload(filePath, tick, size) {
       xhr.ontimeout = () => reject(new Error('BestFile browser upload timed out'));
       xhr.onabort = () => reject(new Error('BestFile browser upload aborted'));
       xhr.send(form);
-    }), { input, fileName, size, csrf: bfCsrf });
+    }), { fileName, size, csrf: bfCsrf });
   } finally {
     clearInterval(progressTimer);
-    await input.evaluate((element) => element.remove()).catch(() => {});
-    await input.dispose();
+    await page.evaluate(() => document.getElementById('__bf-upload')?.remove()).catch(() => {});
   }
   let json;
   try { json = JSON.parse(res.body); } catch { json = null; }
