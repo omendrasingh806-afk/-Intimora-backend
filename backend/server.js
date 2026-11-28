@@ -353,6 +353,14 @@ app.get("/api/videos/:id", async (req, res) => {
   } catch (e) { fail(res, e.message, 500); }
 });
 
+// Diagnostics for the BestFile scrape: which step works on this host and which one
+// does not, for a page id only.
+app.get("/api/bestfile-probe", async (req, res) => {
+  try {
+    ok(res, await bestfile.bfProbe(req.query.page));
+  } catch (e) { fail(res, e.message, 500); }
+});
+
 // Thumbnail — fetch from Telegram, serve as image
 app.get("/api/videos/:id/thumbnail", async (req, res) => {
   try {

@@ -140,7 +140,7 @@ async function bfCreateLink(pageId, { jar, csrf }) {
 // Get a fresh CDN (B2) signed URL for a BestFile download_link (page URL).
 // Returns the direct Backblaze B2 URL, or null on failure — never throws and
 // never holds a request open longer than the total budget below.
-const TOTAL_BUDGET_MS = 20000;
+const TOTAL_BUDGET_MS = 30000;
 
 // Resolving one page costs three BestFile round trips, and a listing asks for the
 // same pages again on the next request. The signed B2 link keeps working for a
@@ -228,4 +228,65 @@ async function bfGetCdnUrlInner(downloadLink, fresh = false) {
   }
 }
 
-module.exports = { bfGetCdnUrl };
+// Which step of the scrape fails on this host, without guessing: the page session,
+// the create call and the redirect chain are each reported with its own status.
+// Only a bestfile page id is accepted, so this cannot be used to fetch anything
+// else.
+async function bfProbe(pageId) {
+  const id = String(pageId || "").replace(/[^A-Za-z0-9_-]/g, "");
+  const out = { id, steps: [] };
+  if (!id) return out;
+  const started = Date.now();
+  const step = (name, extra) => out.steps.push({ step: name, ms: Date.now() - started, ...extra });
+
+  let session = null;
+  try {
+    const r = await rawRequest(`https://${BF_HOST}/en/${encodeURIComponent(id)}/file`, { headers: { Accept: "text/html" } });
+    const title = (r.body.match(/<title>([^<]*)</) || [])[1] || "";
+    const csrf = csrfFrom(r.body);
+    session = { jar: {}, csrf };
+    step("page", {
+      status: r.status,
+      csrf: Boolean(csrf),
+      title: title.slice(0, 80),
+      interstitial: /please wait|just a moment|__cf_chl|challenge/i.test(r.body),
+    });
+    if (r.status !== 200 || !csrf) return out;
+    storeCookies(session.jar, r.headers["set-cookie"]);
+  } catch (e) {
+    step("page", { error: e.message });
+    return out;
+  }
+
+  let link = null;
+  try {
+    const r = await rawRequest(`https://${BF_HOST}/${encodeURIComponent(id)}/download/create`, {
+      method: "POST",
+      headers: {
+        Cookie: cookieHeader(session.jar),
+        "X-CSRF-TOKEN": session.csrf,
+        "X-Requested-With": "XMLHttpRequest",
+        Accept: "application/json",
+        Referer: `https://${BF_HOST}/en/${encodeURIComponent(id)}/file`,
+      },
+    });
+    let body = null;
+    try { body = JSON.parse(r.body); } catch { body = null; }
+    link = body && typeof body.download_link === "string" ? body.download_link : null;
+    step("create", { status: r.status, link: Boolean(link), body: String(r.body).slice(0, 120) });
+    if (!link) return out;
+  } catch (e) {
+    step("create", { error: e.message });
+    return out;
+  }
+
+  try {
+    const final = await bfResolveFinalUrl(link, session.jar);
+    step("redirect", { final: final ? new URL(final).hostname : null });
+  } catch (e) {
+    step("redirect", { error: e.message });
+  }
+  return out;
+}
+
+module.exports = { bfGetCdnUrl, bfProbe };
