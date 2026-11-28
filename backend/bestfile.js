@@ -43,12 +43,28 @@ function csrfFrom(html) {
   return m ? m[1] : "";
 }
 
+// Cloudflare scores a request by more than its User-Agent: a bare client looks
+// like a bot and gets the "Just a moment..." page even for a plain page load, so
+// the same header set a real Chrome sends travels with every call.
+const BROWSER_HEADERS = {
+  "User-Agent": BF_UA,
+  "Accept-Language": "en-US,en;q=0.9",
+  "sec-ch-ua": '"Chromium";v="120", "Not(A:Brand";v="24", "Google Chrome";v="120"',
+  "sec-ch-ua-mobile": "?0",
+  "sec-ch-ua-platform": '"Windows"',
+  "sec-fetch-dest": "document",
+  "sec-fetch-mode": "navigate",
+  "sec-fetch-site": "none",
+  "sec-fetch-user": "?1",
+  "Upgrade-Insecure-Requests": "1",
+};
+
 // Raw request to any host. Always resolves/rejects within REQ_TIMEOUT_MS.
 function rawRequest(urlStr, { method = "GET", headers = {}, body = null } = {}) {
   return new Promise((resolve, reject) => {
     const u = new URL(urlStr);
     const mod = u.protocol === "http:" ? http : https;
-    const finalHeaders = { "User-Agent": BF_UA, ...headers };
+    const finalHeaders = { ...BROWSER_HEADERS, ...headers };
     if (body) finalHeaders["Content-Length"] = Buffer.byteLength(body);
 
     const req = mod.request(
