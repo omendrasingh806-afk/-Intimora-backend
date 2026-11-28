@@ -119,6 +119,21 @@ function noStore(res) {
 }
 function fail(res, msg, code = 400) { return res.status(code).json({ ok: false, error: msg }); }
 
+// An anonymous listing is the same answer for every visitor, so a shared cache
+// (the host's own edge) may keep it for a few seconds instead of every visitor
+// waiting for the backend. A signed-in answer carries that account's premium
+// links, so it is never cached and never shared.
+function cacheListing(req, res, seconds) {
+  if (req.headers.authorization || req.query.viewer) {
+    return res.set("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+  }
+  res.set("Cache-Control", `public, max-age=${seconds}, s-maxage=${seconds}, stale-while-revalidate=${seconds * 2}`);
+  // The same URL answers differently once a token is sent, so the token is part
+  // of the cache key rather than something the cache has to guess about.
+  res.set("Vary", "Origin, Authorization");
+  return res;
+}
+
 // serialize video metadata for the public API
 function publicVideo(v) {
   // A third-party record is played by its own source: it has no stream of ours
@@ -295,12 +310,14 @@ app.get("/api/videos", async (req, res) => {
   try {
     const cursor = parseInt(req.query.cursor, 10) || 0;
     const limit = Math.min(parseInt(req.query.limit, 10) || 12, 50);
-    const metas = await store.listVideos(cursor, limit);
-    const uid = await optionalUid(req);
+    // The visitor lookup and the catalogue read need nothing from each other, so
+    // a signed-in request no longer waits for the two of them one after another.
+    const [metas, uid] = await Promise.all([store.listVideos(cursor, limit), optionalUid(req)]);
     const videos = await withDirectLinks(await Promise.all(metas.map((m) => premium.shapeVideo(publicVideo(m), m, uid))));
     // A short page is the end, and the cursor must not repeat the last item's
     // timestamp forever (the list would never finish loading).
     const nextCursor = videos.length >= limit ? metas[metas.length - 1].createdAt : null;
+    cacheListing(req, res, 10);
     ok(res, { videos, nextCursor });
   } catch (e) { fail(res, e.message, 500); }
 });
@@ -311,9 +328,9 @@ app.get("/api/search", async (req, res) => {
     const q = (req.query.q || "").trim();
     if (!q) return ok(res, { videos: [], nextCursor: null });
     const limit = Math.min(parseInt(req.query.limit, 10) || 12, 50);
-    const metas = await store.searchVideos(q);
-    const uid = await optionalUid(req);
+    const [metas, uid] = await Promise.all([store.searchVideos(q), optionalUid(req)]);
     const videos = await withDirectLinks(await Promise.all(metas.slice(0, limit).map((m) => premium.shapeVideo(publicVideo(m), m, uid))));
+    cacheListing(req, res, 30);
     ok(res, { videos, nextCursor: null });
   } catch (e) { fail(res, e.message, 500); }
 });
@@ -344,8 +361,11 @@ app.get("/api/videos/:id/thumbnail", async (req, res) => {
     const img = await tg.fetchThumbnail(streamFormat);
     if (!img) return fail(res, "No thumbnail", 404);
     res.set("Content-Type", "image/jpeg");
-    res.set("Cache-Control", "public, max-age=86400");
+    // A poster is one file for every visitor. Without s-maxage only the browser
+    // kept it, so each new visitor still paid for a Telegram read.
+    res.set("Cache-Control", "public, max-age=86400, s-maxage=86400, stale-while-revalidate=604800");
     res.set("Cross-Origin-Resource-Policy", "cross-origin");
+    res.set("Vary", "Origin");
     res.send(img);
   } catch (e) {
     fail(res, e.message, 500);

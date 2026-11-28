@@ -133,28 +133,64 @@ async function bfCreateLink(pageId, { jar, csrf }) {
 // never holds a request open longer than the total budget below.
 const TOTAL_BUDGET_MS = 20000;
 
+// Resolving one page costs three BestFile round trips, and a listing asks for the
+// same pages again on the next request. The signed B2 link keeps working for a
+// while, so it is remembered for a short window and concurrent requests for the
+// same page share one resolution instead of repeating it.
+const CDN_TTL_MS = Math.max(1000, Number(process.env.BESTFILE_CDN_TTL_MS) || 120000);
+const CDN_MAX_ENTRIES = 500;
+const cdnCache = new Map(); // pageId -> { url, at }
+const cdnInflight = new Map(); // pageId -> Promise<string|null>
+
+function pageIdOf(downloadLink) {
+  if (typeof downloadLink !== "string") return "";
+  const m = downloadLink.match(
+    new RegExp("https?://" + BF_HOST.replace(/\./g, "\\.") + "/([^/]+)/file", "i")
+  );
+  return m ? m[1] : "";
+}
+
+function rememberCdnUrl(pageId, url) {
+  if (!pageId || !url) return;
+  if (cdnCache.size >= CDN_MAX_ENTRIES) {
+    // Oldest first: a Map keeps insertion order, and a re-set refreshes it.
+    cdnCache.delete(cdnCache.keys().next().value);
+  }
+  cdnCache.set(pageId, { url, at: Date.now() });
+}
+
 // `fresh` skips the in-memory cache, so the caller gets a link signed for this
 // request instead of one issued earlier (the signed file URL expires).
 async function bfGetCdnUrl(downloadLink, { fresh = false } = {}) {
+  const pageId = pageIdOf(downloadLink);
+  if (!fresh && pageId) {
+    const hit = cdnCache.get(pageId);
+    if (hit && Date.now() - hit.at < CDN_TTL_MS) return hit.url;
+    const pending = cdnInflight.get(pageId);
+    if (pending) return pending;
+  }
+
   let timer;
   const budget = new Promise((resolve) => {
     timer = setTimeout(() => resolve(null), TOTAL_BUDGET_MS);
   });
+  const work = bfGetCdnUrlInner(downloadLink, fresh).then((url) => {
+    rememberCdnUrl(pageId, url);
+    return url;
+  });
+  if (pageId) cdnInflight.set(pageId, work);
   try {
-    return await Promise.race([bfGetCdnUrlInner(downloadLink, fresh), budget]);
+    return await Promise.race([work, budget]);
   } finally {
     clearTimeout(timer);
+    if (pageId) cdnInflight.delete(pageId);
   }
 }
 
 async function bfGetCdnUrlInner(downloadLink, fresh = false) {
   try {
-    if (typeof downloadLink !== "string") return null;
-    const m = downloadLink.match(
-      new RegExp("https?://" + BF_HOST.replace(/\./g, "\\.") + "/([^/]+)/file", "i")
-    );
-    if (!m) return null;
-    const pageId = m[1];
+    const pageId = pageIdOf(downloadLink);
+    if (!pageId) return null;
 
     const session = await bfPageSession(pageId);
     if (!session) return null;
