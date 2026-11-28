@@ -15,7 +15,14 @@ const BF_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36";
 
 // Every network call is bounded: a serverless request must never hang on BestFile.
-const REQ_TIMEOUT_MS = 8000;
+const REQ_TIMEOUT_MS = 12000;
+
+// Cloud hosts are the ones that hang on bestfile.io: the page, the create call and
+// the redirect chain are the same host, so the connection is reused, and IPv4 is
+// forced because a broken IPv6 route on the host looks exactly like a stalled
+// request (an 8 s timeout and a silent fall back to the Telegram stream).
+const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 24, family: 4, timeout: REQ_TIMEOUT_MS });
+const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 24, family: 4, timeout: REQ_TIMEOUT_MS });
 
 function cookieHeader(jar) {
   return Object.entries(jar).map(([k, v]) => k + "=" + v).join("; ");
@@ -51,6 +58,8 @@ function rawRequest(urlStr, { method = "GET", headers = {}, body = null } = {}) 
         method,
         headers: finalHeaders,
         timeout: REQ_TIMEOUT_MS,
+        agent: u.protocol === "http:" ? httpAgent : httpsAgent,
+        family: 4,
       },
       (res) => {
         const chunks = [];
@@ -137,7 +146,9 @@ const TOTAL_BUDGET_MS = 20000;
 // same pages again on the next request. The signed B2 link keeps working for a
 // while, so it is remembered for a short window and concurrent requests for the
 // same page share one resolution instead of repeating it.
-const CDN_TTL_MS = Math.max(1000, Number(process.env.BESTFILE_CDN_TTL_MS) || 120000);
+// The signed Backblaze URL is good for an hour, so the resolved link is kept well
+// inside that: one scrape per video per window instead of one per visitor.
+const CDN_TTL_MS = Math.max(1000, Number(process.env.BESTFILE_CDN_TTL_MS) || 45 * 60 * 1000);
 const CDN_MAX_ENTRIES = 500;
 const cdnCache = new Map(); // pageId -> { url, at }
 const cdnInflight = new Map(); // pageId -> Promise<string|null>
@@ -161,29 +172,34 @@ function rememberCdnUrl(pageId, url) {
 
 // `fresh` skips the in-memory cache, so the caller gets a link signed for this
 // request instead of one issued earlier (the signed file URL expires).
-async function bfGetCdnUrl(downloadLink, { fresh = false } = {}) {
+async function bfGetCdnUrl(downloadLink, { fresh = false, budgetMs = TOTAL_BUDGET_MS } = {}) {
   const pageId = pageIdOf(downloadLink);
-  if (!fresh && pageId) {
+  if (!pageId) return null;
+  if (!fresh) {
     const hit = cdnCache.get(pageId);
     if (hit && Date.now() - hit.at < CDN_TTL_MS) return hit.url;
-    const pending = cdnInflight.get(pageId);
-    if (pending) return pending;
   }
 
+  let work = fresh ? null : cdnInflight.get(pageId);
+  if (!work) {
+    // The resolution is not cancelled when a caller stops waiting for it: the
+    // answer still lands in the cache, so the play request that follows is a
+    // redirect instead of another scrape.
+    const started = bfGetCdnUrlInner(downloadLink, fresh)
+      .then((url) => { rememberCdnUrl(pageId, url); return url; })
+      .catch(() => null)
+      .finally(() => { if (cdnInflight.get(pageId) === started) cdnInflight.delete(pageId); });
+    work = started;
+    if (!fresh) cdnInflight.set(pageId, work);
+  }
+
+  if (budgetMs <= 0) return work;
   let timer;
-  const budget = new Promise((resolve) => {
-    timer = setTimeout(() => resolve(null), TOTAL_BUDGET_MS);
-  });
-  const work = bfGetCdnUrlInner(downloadLink, fresh).then((url) => {
-    rememberCdnUrl(pageId, url);
-    return url;
-  });
-  if (pageId) cdnInflight.set(pageId, work);
+  const budget = new Promise((resolve) => { timer = setTimeout(() => resolve(null), budgetMs); });
   try {
     return await Promise.race([work, budget]);
   } finally {
     clearTimeout(timer);
-    if (pageId) cdnInflight.delete(pageId);
   }
 }
 

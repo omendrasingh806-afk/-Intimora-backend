@@ -188,9 +188,13 @@ async function withDirectLinks(videos, { trailers = "premium" } = {}) {
     // the ones whose full link is withheld, so the trailer is what a caller can
     // actually use. A single video resolves both.
     const wantsTrailer = !!trailerPage && (trailers === "all" || v.premium === true);
+    // A listing must not wait for a scrape per video: each one keeps running in
+    // the background and lands in the link cache, so the play request after the
+    // tap is answered from there.
+    const budgetMs = trailers === "all" ? undefined : 1500;
     const [direct, trailerDirect] = await Promise.all([
-      page ? bestfile.bfGetCdnUrl(page) : null,
-      wantsTrailer ? bestfile.bfGetCdnUrl(trailerPage) : null,
+      page ? bestfile.bfGetCdnUrl(page, { budgetMs }) : null,
+      wantsTrailer ? bestfile.bfGetCdnUrl(trailerPage, { budgetMs }) : null,
     ]);
     if (direct && v.bestfile) {
       v.bestfile.page_url = page;
@@ -404,7 +408,10 @@ app.get("/api/videos/:id/stream", async (req, res) => {
     if (bf && bf.download_link) {
       let cdnUrl = null;
       try {
-        cdnUrl = await bestfile.bfGetCdnUrl(bf.download_link);
+        // A cached link answers at once. A cold one gets a short budget and then
+        // keeps resolving behind this request, so bytes start immediately and
+        // the next play is a redirect.
+        cdnUrl = await bestfile.bfGetCdnUrl(bf.download_link, { budgetMs: 4000 });
       } catch (e) {
         console.error("bestfile cdn error:", e.message);
       }
