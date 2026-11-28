@@ -244,6 +244,36 @@ async function bfGetCdnUrlInner(downloadLink, fresh = false) {
   }
 }
 
+// What exactly Cloudflare answered: the challenge scripts name their own type
+// (managed / interactive / js), and the headers say whether this is a challenge
+// or a hard block.
+function challengeFingerprint(r) {
+  const body = String((r && r.body) || "");
+  const h = (r && r.headers) || {};
+  const setCookie = h["set-cookie"];
+  const cookieList = Array.isArray(setCookie) ? setCookie : setCookie ? [setCookie] : [];
+  const field = (name) => {
+    const m = body.match(new RegExp(name + "\\s*:\\s*'([^']*)'"));
+    return m ? m[1] : "";
+  };
+  return {
+    status: r.status,
+    server: h.server || "",
+    cfRay: h["cf-ray"] || "",
+    mitigated: h["cf-mitigated"] || "",
+    cacheStatus: h["cf-cache-status"] || "",
+    contentType: h["content-type"] || "",
+    cookies: cookieList.map((c) => String(c).split("=")[0].trim()),
+    challengeType: field("cType"),
+    challengeZone: field("cZone"),
+    widgetId: field("chlApiWidgetId") || field("cvId"),
+    platformScript: /\/cdn-cgi\/challenge-platform\//.test(body),
+    turnstile: /turnstile/i.test(body),
+    markers: ["_cf_chl_opt", "cf-chl-widget", "challenge-form", "__cf_chl_rt_tk", "cf_chl_"].filter((m) => body.includes(m)),
+    bodyStart: body.slice(0, 160).replace(/\s+/g, " "),
+  };
+}
+
 // Which step of the scrape fails on this host, without guessing: the page session,
 // the create call and the redirect chain are each reported with its own status.
 // Only a bestfile page id is accepted, so this cannot be used to fetch anything
@@ -266,6 +296,7 @@ async function bfProbe(pageId) {
       csrf: Boolean(csrf),
       title: title.slice(0, 80),
       interstitial: /please wait|just a moment|__cf_chl|challenge/i.test(r.body),
+      challenge: challengeFingerprint(r),
     });
     if (r.status !== 200 || !csrf) return out;
     storeCookies(session.jar, r.headers["set-cookie"]);
